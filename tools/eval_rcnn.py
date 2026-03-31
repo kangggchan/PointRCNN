@@ -1,4 +1,4 @@
-import _init_path
+import os, sys as _sys; _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import _init_path
 import os
 import numpy as np
 import torch
@@ -23,7 +23,11 @@ from tensorboardX import SummaryWriter
 import tqdm
 
 
-np.random.seed(1024)  # set the same seed
+def _torch_load_compat(filename):
+    try:
+        return torch.load(filename, weights_only=False)
+    except TypeError:
+        return torch.load(filename)
 
 parser = argparse.ArgumentParser(description="arg parser")
 parser.add_argument('--cfg_file', type=str, default='cfgs/default.yml', help='specify the config for evaluation')
@@ -37,6 +41,8 @@ parser.add_argument("--rcnn_ckpt", type=str, default=None, help="specify the che
 
 parser.add_argument('--batch_size', type=int, default=1, help='batch size for evaluation')
 parser.add_argument('--workers', type=int, default=4, help='number of workers for dataloader')
+parser.add_argument('--data_root', type=str, default='../data/dataset',
+                    help='dataset root containing KITTI/ for custom evaluation')
 parser.add_argument("--extra_tag", type=str, default='default', help="extra tag for multiple evaluation")
 parser.add_argument('--output_dir', type=str, default=None, help='specify an output directory if needed')
 parser.add_argument("--ckpt_dir", type=str, default=None, help="specify a ckpt directory to be evaluated if needed")
@@ -66,7 +72,7 @@ def create_logger(log_file):
     return logging.getLogger(__name__)
 
 
-def save_kitti_format(sample_id, calib, bbox3d, kitti_output_dir, scores, img_shape):
+def save_kitti_format(sample_id, calib, bbox3d, kitti_output_dir, scores, img_shape, gt_labels=None, gt_boxes3d=None):
     corners3d = kitti_utils.boxes3d_to_corners3d(bbox3d)
     img_boxes, _ = calib.corners3d_to_img_boxes(corners3d)
 
@@ -88,10 +94,29 @@ def save_kitti_format(sample_id, calib, bbox3d, kitti_output_dir, scores, img_sh
             beta = np.arctan2(z, x)
             alpha = -np.sign(beta) * np.pi / 2 + beta + ry
 
+            # Get class name from ground truth matching
+            class_name = 'Car'  # default
+            if gt_labels is not None and len(gt_labels) > 0 and gt_boxes3d is not None:
+                # Match this proposal to closest ground truth by IoU
+                gt_boxes_np = gt_boxes3d.cpu().numpy() if hasattr(gt_boxes3d, 'cpu') else np.array(gt_boxes3d)
+                valid_mask = np.sum(np.abs(gt_boxes_np[:, 0:7]), axis=1) > 0
+                if np.any(valid_mask):
+                    valid_gt_boxes = gt_boxes_np[valid_mask]
+                    try:
+                        iou = iou3d_utils.boxes_iou3d_gpu(
+                            torch.from_numpy(bbox3d[k:k+1]).cuda().float(),
+                            torch.from_numpy(valid_gt_boxes[:, 0:7]).cuda().float()
+                        ).cpu().numpy()[0]
+                        best_idx = np.argmax(iou)
+                        if iou[best_idx] > 0.01:
+                            class_name = gt_labels[np.where(valid_mask)[0][best_idx]].cls_type
+                    except:
+                        pass
+            
             print('%s -1 -1 %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f' %
-                  (cfg.CLASSES, alpha, img_boxes[k, 0], img_boxes[k, 1], img_boxes[k, 2], img_boxes[k, 3],
-                   bbox3d[k, 3], bbox3d[k, 4], bbox3d[k, 5], bbox3d[k, 0], bbox3d[k, 1], bbox3d[k, 2],
-                   bbox3d[k, 6], scores[k]), file=f)
+                (class_name, alpha, img_boxes[k, 0], img_boxes[k, 1], img_boxes[k, 2], img_boxes[k, 3],
+                bbox3d[k, 3], bbox3d[k, 4], bbox3d[k, 5], bbox3d[k, 0], bbox3d[k, 1], bbox3d[k, 2],
+                bbox3d[k, 6], scores[k]), file=f)
 
 
 def save_rpn_features(seg_result, rpn_scores_raw, pts_features, backbone_xyz, backbone_features, kitti_features_dir,
@@ -227,7 +252,15 @@ def eval_one_epoch_rpn(model, dataloader, epoch_id, result_dir, logger):
                 calib = dataset.get_calib(cur_sample_id)
                 cur_boxes3d = cur_boxes3d.cpu().numpy()
                 image_shape = dataset.get_image_shape(cur_sample_id)
-                save_kitti_format(cur_sample_id, calib, cur_boxes3d, kitti_output_dir, cur_scores_raw, image_shape)
+                
+                # Get ground truth labels and boxes for proposal classification
+                gt_labels = None
+                gt_boxes = None
+                if not args.test and cur_gt_boxes3d.shape[0] > 0:
+                    gt_labels = dataset.get_label(cur_sample_id)
+                    gt_boxes = cur_gt_boxes3d
+                
+                save_kitti_format(cur_sample_id, calib, cur_boxes3d, kitti_output_dir, cur_scores_raw, image_shape, gt_labels=gt_labels, gt_boxes3d=gt_boxes)
 
         disp_dict = {'mode': mode, 'recall': '%d/%d' % (total_recalled_bbox_list[3], total_gt_bbox),
                      'rpn_iou': rpn_iou_avg / max(cnt, 1.0)}
@@ -843,10 +876,10 @@ def repeat_eval_ckpt(root_result_dir, ckpt_dir):
 
 def create_dataloader(logger):
     mode = 'TEST' if args.test else 'EVAL'
-    DATA_PATH = os.path.join('..', 'data')
+    data_path = args.data_root
 
     # create dataloader
-    test_set = KittiRCNNDataset(root_dir=DATA_PATH, npoints=cfg.RPN.NUM_POINTS, split=cfg.TEST.SPLIT, mode=mode,
+    test_set = KittiRCNNDataset(root_dir=data_path, npoints=cfg.RPN.NUM_POINTS, split=cfg.TEST.SPLIT, mode=mode,
                                 random_select=args.random_select,
                                 rcnn_eval_roi_dir=args.rcnn_eval_roi_dir,
                                 rcnn_eval_feature_dir=args.rcnn_eval_feature_dir,

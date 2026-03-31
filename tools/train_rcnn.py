@@ -1,4 +1,4 @@
-import _init_path
+import os, sys as _sys; _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import _init_path
 import torch
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_sched
@@ -9,6 +9,7 @@ import os
 import argparse
 import logging
 from functools import partial
+from pathlib import Path
 
 from lib.net.point_rcnn import PointRCNN
 import lib.net.train_functions as train_functions
@@ -17,6 +18,7 @@ from lib.config import cfg, cfg_from_file, save_config_to_file
 import tools.train_utils.train_utils as train_utils
 from tools.train_utils.fastai_optim import OptimWrapper
 from tools.train_utils import learning_schedules_fastai as lsf
+from tools.preprocess_dataset import preprocess_dataset
 
 
 parser = argparse.ArgumentParser(description="arg parser")
@@ -29,11 +31,13 @@ parser.add_argument('--workers', type=int, default=8, help='number of workers fo
 parser.add_argument("--ckpt_save_interval", type=int, default=5, help="number of training epochs")
 parser.add_argument('--output_dir', type=str, default=None, help='specify an output directory if needed')
 parser.add_argument('--mgpus', action='store_true', default=False, help='whether to use multiple gpu')
+parser.add_argument('--data_root', type=str, default='../data/dataset', help='dataset root containing bin/ and labels/')
+parser.add_argument('--skip_preprocess', action='store_true', default=False, help='skip auto preprocessing from raw dataset')
 
 parser.add_argument("--ckpt", type=str, default=None, help="continue training from this checkpoint")
 parser.add_argument("--rpn_ckpt", type=str, default=None, help="specify the well-trained rpn checkpoint")
 
-parser.add_argument("--gt_database", type=str, default='gt_database/train_gt_database_3level_Car.pkl',
+parser.add_argument("--gt_database", type=str, default=None,
                     help='generated gt database for augmentation')
 parser.add_argument("--rcnn_training_roi_dir", type=str, default=None,
                     help='specify the saved rois for rcnn training when using rcnn_offline mode')
@@ -59,21 +63,47 @@ def create_logger(log_file):
 
 
 def create_dataloader(logger):
-    DATA_PATH = os.path.join('../', 'data')
+    data_path = args.data_root
+
+    if not args.skip_preprocess:
+        dataset_root = Path(data_path).resolve()
+        kitti_imagesets = dataset_root / 'KITTI' / 'ImageSets'
+        train_split_file = kitti_imagesets / f"{cfg.TRAIN.SPLIT}.txt"
+
+        if not train_split_file.exists():
+            logger.info('KITTI-style files not found at %s, preprocessing raw dataset...', str(dataset_root))
+            stats = preprocess_dataset(dataset_root, classes=KittiRCNNDataset.parse_classes(cfg.CLASSES), logger=logger)
+            logger.info('Preprocess complete: total=%d train=%d val=%d', stats['total'], stats['train'], stats['val'])
+
+    gt_database_path = None
+    if args.gt_database:
+        candidate_paths = [
+            Path(args.gt_database),
+            Path(__file__).resolve().parent / args.gt_database,
+            Path(__file__).resolve().parent.parent / args.gt_database,
+        ]
+        for candidate in candidate_paths:
+            if candidate.exists():
+                gt_database_path = str(candidate.resolve())
+                break
+
+    if cfg.GT_AUG_ENABLED and gt_database_path is None:
+        logger.warning('GT database not found (arg: %s). Disable GT_AUG_ENABLED for this run.', args.gt_database)
+        cfg.GT_AUG_ENABLED = False
 
     # create dataloader
-    train_set = KittiRCNNDataset(root_dir=DATA_PATH, npoints=cfg.RPN.NUM_POINTS, split=cfg.TRAIN.SPLIT, mode='TRAIN',
+    train_set = KittiRCNNDataset(root_dir=data_path, npoints=cfg.RPN.NUM_POINTS, split=cfg.TRAIN.SPLIT, mode='TRAIN',
                                  logger=logger,
                                  classes=cfg.CLASSES,
                                  rcnn_training_roi_dir=args.rcnn_training_roi_dir,
                                  rcnn_training_feature_dir=args.rcnn_training_feature_dir,
-                                 gt_database_dir=args.gt_database)
+                                 gt_database_dir=gt_database_path)
     train_loader = DataLoader(train_set, batch_size=args.batch_size, pin_memory=True,
                               num_workers=args.workers, shuffle=True, collate_fn=train_set.collate_batch,
                               drop_last=True)
 
     if args.train_with_eval:
-        test_set = KittiRCNNDataset(root_dir=DATA_PATH, npoints=cfg.RPN.NUM_POINTS, split=cfg.TRAIN.VAL_SPLIT, mode='EVAL',
+        test_set = KittiRCNNDataset(root_dir=data_path, npoints=cfg.RPN.NUM_POINTS, split=cfg.TRAIN.VAL_SPLIT, mode='EVAL',
                                     logger=logger,
                                     classes=cfg.CLASSES,
                                     rcnn_eval_roi_dir=args.rcnn_eval_roi_dir,

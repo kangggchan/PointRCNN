@@ -1,6 +1,6 @@
-CLASSES: Car
+CLASSES: Car,Human,ForkLift,CargoBike,ELFplusplus,FTS
 
-INCLUDE_SIMILAR_TYPE: True
+INCLUDE_SIMILAR_TYPE: False
 
 # config of augmentation
 AUG_DATA: True
@@ -56,12 +56,14 @@ RPN:
     FG_WEIGHT: 15
     FOCAL_ALPHA: [0.25, 0.75]
     FOCAL_GAMMA: 2.0
+    # Class weights for balanced training (Background, Car, Human, ForkLift, CargoBike, ELFplusplus, FTS)
+    CLS_WEIGHT: [1.0, 3.18, 0.35, 1.17, 1.53, 1.26, 1.88]
     REG_LOSS_WEIGHT: [1.0, 1.0, 1.0, 1.0]
     LOSS_WEIGHT: [1.0, 1.0]
     NMS_TYPE: normal
 
     # config of testing
-    SCORE_THRESH: 0.3
+    SCORE_THRESH: 0.5
 
 # 2. config of rcnn network
 RCNN:
@@ -109,11 +111,12 @@ RCNN:
     REG_FC: [256, 256]
 
     # config of training
-    LOSS_CLS: BinaryCrossEntropy
+    LOSS_CLS: CrossEntropy
     FOCAL_ALPHA: [0.25, 0.75]
     FOCAL_GAMMA: 2.0
-    CLS_WEIGHT: [1.0, 1.0, 1.0]
-    CLS_FG_THRESH: 0.6
+    # Class weights for balanced training (Background, Car, Human, ForkLift, CargoBike, ELFplusplus, FTS)
+    CLS_WEIGHT: [1.0, 3.18, 0.35, 1.17, 1.53, 1.26, 1.88]
+    CLS_FG_THRESH: 0.5
     CLS_BG_THRESH: 0.45
     CLS_BG_THRESH_LO: 0.05
     REG_FG_THRESH: 0.55
@@ -122,12 +125,12 @@ RCNN:
     HARD_BG_RATIO: 0.8
 
     # config of testing
-    SCORE_THRESH: 0.3
+    SCORE_THRESH: 0.5
     NMS_THRESH: 0.1
 
 # general training config
 TRAIN:
-    SPLIT: train
+    SPLIT: train_aug
     VAL_SPLIT: smallval
 
     LR: 0.002
@@ -136,7 +139,7 @@ TRAIN:
     DECAY_STEP_LIST: [100, 150, 180, 200]
     LR_WARMUP: True
     WARMUP_MIN: 0.0002
-    WARMUP_EPOCH: 1
+    WARMUP_EPOCH: 2
 
     BN_MOMENTUM: 0.1
     BN_DECAY: 0.5

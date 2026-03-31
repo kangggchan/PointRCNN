@@ -14,7 +14,7 @@ class ProposalTargetLayer(nn.Module):
     def forward(self, input_dict):
         roi_boxes3d, gt_boxes3d = input_dict['roi_boxes3d'], input_dict['gt_boxes3d']
 
-        batch_rois, batch_gt_of_rois, batch_roi_iou = self.sample_rois_for_rcnn(roi_boxes3d, gt_boxes3d)
+        batch_rois, batch_gt_of_rois, batch_roi_iou, batch_cls_label = self.sample_rois_for_rcnn(roi_boxes3d, gt_boxes3d)
 
         rpn_xyz, rpn_features = input_dict['rpn_xyz'], input_dict['rpn_features']
         if cfg.RCNN.USE_INTENSITY:
@@ -59,19 +59,15 @@ class ProposalTargetLayer(nn.Module):
         valid_mask = (pooled_empty_flag == 0)
         reg_valid_mask = ((batch_roi_iou > cfg.RCNN.REG_FG_THRESH) & valid_mask).long()
 
-        # classification label
-        batch_cls_label = (batch_roi_iou > cfg.RCNN.CLS_FG_THRESH).long()
-        invalid_mask = (batch_roi_iou > cfg.RCNN.CLS_BG_THRESH) & (batch_roi_iou < cfg.RCNN.CLS_FG_THRESH)
-        batch_cls_label[valid_mask == 0] = -1
-        batch_cls_label[invalid_mask > 0] = -1
+        # batch_cls_label is now computed in sample_rois_for_rcnn and returned
 
         output_dict = {'sampled_pts': sampled_pts.view(-1, cfg.RCNN.NUM_POINTS, 3),
-                       'pts_feature': sampled_features.view(-1, cfg.RCNN.NUM_POINTS, sampled_features.shape[3]),
-                       'cls_label': batch_cls_label.view(-1),
-                       'reg_valid_mask': reg_valid_mask.view(-1),
-                       'gt_of_rois': batch_gt_of_rois.view(-1, 7),
-                       'gt_iou': batch_roi_iou.view(-1),
-                       'roi_boxes3d': batch_rois.view(-1, 7)}
+                   'pts_feature': sampled_features.view(-1, cfg.RCNN.NUM_POINTS, sampled_features.shape[3]),
+                   'cls_label': batch_cls_label.view(-1),
+                   'reg_valid_mask': reg_valid_mask.view(-1),
+                   'gt_of_rois': batch_gt_of_rois.view(-1, 7),
+                   'gt_iou': batch_roi_iou.view(-1),
+                   'roi_boxes3d': batch_rois.view(-1, 7)}
 
         return output_dict
 
@@ -91,6 +87,7 @@ class ProposalTargetLayer(nn.Module):
         batch_rois = gt_boxes3d.new(batch_size, cfg.RCNN.ROI_PER_IMAGE, 7).zero_()
         batch_gt_of_rois = gt_boxes3d.new(batch_size, cfg.RCNN.ROI_PER_IMAGE, 7).zero_()
         batch_roi_iou = gt_boxes3d.new(batch_size, cfg.RCNN.ROI_PER_IMAGE).zero_()
+        batch_cls_label = gt_boxes3d.new(batch_size, cfg.RCNN.ROI_PER_IMAGE).zero_()  # default to bg (0)
 
         for idx in range(batch_size):
             cur_roi, cur_gt = roi_boxes3d[idx], gt_boxes3d[idx]
@@ -109,9 +106,6 @@ class ProposalTargetLayer(nn.Module):
             fg_thresh = min(cfg.RCNN.REG_FG_THRESH, cfg.RCNN.CLS_FG_THRESH)
             fg_inds = torch.nonzero((max_overlaps >= fg_thresh)).view(-1)
 
-            # TODO: this will mix the fg and bg when CLS_BG_THRESH_LO < iou < CLS_BG_THRESH
-            # fg_inds = torch.cat((fg_inds, roi_assignment), dim=0)  # consider the roi which has max_iou with gt as fg
-
             easy_bg_inds = torch.nonzero((max_overlaps < cfg.RCNN.CLS_BG_THRESH_LO)).view(-1)
             hard_bg_inds = torch.nonzero((max_overlaps < cfg.RCNN.CLS_BG_THRESH) &
                                          (max_overlaps >= cfg.RCNN.CLS_BG_THRESH_LO)).view(-1)
@@ -120,36 +114,28 @@ class ProposalTargetLayer(nn.Module):
             bg_num_rois = hard_bg_inds.numel() + easy_bg_inds.numel()
 
             if fg_num_rois > 0 and bg_num_rois > 0:
-                # sampling fg
                 fg_rois_per_this_image = min(fg_rois_per_image, fg_num_rois)
-
                 rand_num = torch.from_numpy(np.random.permutation(fg_num_rois)).type_as(gt_boxes3d).long()
                 fg_inds = fg_inds[rand_num[:fg_rois_per_this_image]]
-
-                # sampling bg
                 bg_rois_per_this_image = cfg.RCNN.ROI_PER_IMAGE - fg_rois_per_this_image
                 bg_inds = self.sample_bg_inds(hard_bg_inds, easy_bg_inds, bg_rois_per_this_image)
-
             elif fg_num_rois > 0 and bg_num_rois == 0:
-                # sampling fg
                 rand_num = np.floor(np.random.rand(cfg.RCNN.ROI_PER_IMAGE) * fg_num_rois)
                 rand_num = torch.from_numpy(rand_num).type_as(gt_boxes3d).long()
                 fg_inds = fg_inds[rand_num]
                 fg_rois_per_this_image = cfg.RCNN.ROI_PER_IMAGE
                 bg_rois_per_this_image = 0
             elif bg_num_rois > 0 and fg_num_rois == 0:
-                # sampling bg
                 bg_rois_per_this_image = cfg.RCNN.ROI_PER_IMAGE
                 bg_inds = self.sample_bg_inds(hard_bg_inds, easy_bg_inds, bg_rois_per_this_image)
-
                 fg_rois_per_this_image = 0
             else:
                 import pdb
                 pdb.set_trace()
                 raise NotImplementedError
 
-            # augment the rois by noise
             roi_list, roi_iou_list, roi_gt_list = [], [], []
+            cls_label = batch_cls_label[idx]
             if fg_rois_per_this_image > 0:
                 fg_rois_src = cur_roi[fg_inds]
                 gt_of_fg_rois = cur_gt[gt_assignment[fg_inds]]
@@ -159,7 +145,12 @@ class ProposalTargetLayer(nn.Module):
                 roi_list.append(fg_rois)
                 roi_iou_list.append(fg_iou3d)
                 roi_gt_list.append(gt_of_fg_rois)
-
+                # Assign class index from GT for fg
+                if gt_boxes3d.shape[-1] > 7:
+                    matched_gt_classes = cur_gt[gt_assignment[fg_inds], 7].long()
+                else:
+                    matched_gt_classes = torch.ones_like(fg_inds)
+                cls_label[:fg_rois_per_this_image] = matched_gt_classes
             if bg_rois_per_this_image > 0:
                 bg_rois_src = cur_roi[bg_inds]
                 gt_of_bg_rois = cur_gt[gt_assignment[bg_inds]]
@@ -170,16 +161,23 @@ class ProposalTargetLayer(nn.Module):
                 roi_list.append(bg_rois)
                 roi_iou_list.append(bg_iou3d)
                 roi_gt_list.append(gt_of_bg_rois)
-
+                # bg ROIs remain as class 0 (background)
             rois = torch.cat(roi_list, dim=0)
             iou_of_rois = torch.cat(roi_iou_list, dim=0)
             gt_of_rois = torch.cat(roi_gt_list, dim=0)
 
+            # Set invalids to -1 (ignore)
+            invalid_mask = (iou_of_rois > cfg.RCNN.CLS_BG_THRESH) & (iou_of_rois < cfg.RCNN.CLS_FG_THRESH)
+            valid_mask = (torch.cat([torch.ones_like(fg_inds), torch.ones_like(bg_inds)]) if fg_rois_per_this_image > 0 or bg_rois_per_this_image > 0 else torch.zeros_like(rois[:,0])).bool()
+            cls_label[valid_mask == 0] = -1
+            cls_label[invalid_mask > 0] = -1
+
             batch_rois[idx] = rois
             batch_gt_of_rois[idx] = gt_of_rois
             batch_roi_iou[idx] = iou_of_rois
+            batch_cls_label[idx] = cls_label
 
-        return batch_rois, batch_gt_of_rois, batch_roi_iou
+        return batch_rois, batch_gt_of_rois, batch_roi_iou, batch_cls_label
 
     def sample_bg_inds(self, hard_bg_inds, easy_bg_inds, bg_rois_per_this_image):
         if hard_bg_inds.numel() > 0 and easy_bg_inds.numel() > 0:

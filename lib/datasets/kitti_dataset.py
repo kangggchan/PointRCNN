@@ -19,7 +19,13 @@ class KittiDataset(torch_data.Dataset):
         self.image_dir = os.path.join(self.imageset_dir, 'image_2')
         self.lidar_dir = os.path.join(self.imageset_dir, 'velodyne')
         self.calib_dir = os.path.join(self.imageset_dir, 'calib')
-        self.label_dir = os.path.join(self.imageset_dir, 'label_2')
+        
+        # Use aug_label for train_aug split, label_2 for others
+        if 'train_aug' in split:
+            self.label_dir = os.path.join(root_dir, 'KITTI', 'aug_scene', 'training', 'aug_label')
+        else:
+            self.label_dir = os.path.join(self.imageset_dir, 'label_2')
+        
         self.plane_dir = os.path.join(self.imageset_dir, 'planes')
 
     def get_image(self, idx):
@@ -32,7 +38,8 @@ class KittiDataset(torch_data.Dataset):
 
     def get_image_shape(self, idx):
         img_file = os.path.join(self.image_dir, '%06d.png' % idx)
-        assert os.path.exists(img_file)
+        if not os.path.exists(img_file):
+            return 720, 1280, 3
         im = Image.open(img_file)
         width, height = im.size
         return height, width, 3
@@ -54,6 +61,9 @@ class KittiDataset(torch_data.Dataset):
 
     def get_road_plane(self, idx):
         plane_file = os.path.join(self.plane_dir, '%06d.txt' % idx)
+        if not os.path.exists(plane_file):
+            # fallback flat road plane: y = 0 in rect camera coordinates
+            return np.array([0.0, -1.0, 0.0, 0.0], dtype=np.float32)
         with open(plane_file, 'r') as f:
             lines = f.readlines()
         lines = [float(i) for i in lines[3].split()]

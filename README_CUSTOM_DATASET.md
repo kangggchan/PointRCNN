@@ -1,0 +1,262 @@
+# Train PointRCNN on a Custom Dataset (like `data/dataset`)
+
+This guide explains how to train this repo on a custom LiDAR dataset in your format.
+
+> **⚠️ Important**: This repository has been modified to support custom LiDAR coordinate frames. Custom datasets using Z-axis rotation (yaw) are now properly distinguished from KITTI format which uses Y-axis rotation (ry). See [ROTATION_AXIS_FIX.md](ROTATION_AXIS_FIX.md) for technical details on coordinate frame handling.
+
+## 1) Supported custom dataset format
+
+Your dataset root should look like:
+
+```text
+data/dataset/
+  bin/
+    000000.bin
+    000001.bin
+    ...
+  labels/
+    000000.txt
+    000001.txt
+    ...
+```
+
+Rules:
+- Only **paired** files are used (`bin/ID.bin` + `labels/ID.txt`).
+- Unpaired files are skipped.
+- Label names `box`, `boxes`, `bbox` are ignored.
+- Supported classes for training:
+  - `Car`
+  - `Human`
+  - `ForkLift`
+  - `CargoBike`
+  - `ELFplusplus`
+  - `FTS`
+
+## 2) Label formats accepted
+
+The preprocessing supports either of these formats per line:
+
+### A) Lightweight format (recommended for your data)
+
+```text
+ClassName x y z l w h yaw
+```
+
+Example:
+
+```text
+Car 14.0997 -0.3185 0.1975 4.5086 1.7096 1.7837 -2.1002
+Human 10.1259 -2.7427 0.0549 0.9508 0.4599 1.9657 0.1574
+```
+
+### B) KITTI full 15/16-field format
+
+If labels are already KITTI-style, they are preserved.
+
+## 3) One-time preprocessing (creates KITTI-style training layout)
+
+Run:
+
+```bash
+cd PointRCNN/tools
+python preprocess_dataset.py \
+  --dataset_root ../data/dataset \
+  --classes Car,Human,ForkLift,CargoBike,ELFplusplus,FTS
+```
+
+This generates:
+
+```text
+data/dataset/KITTI/
+  ImageSets/{train,val,smallval,trainval,test}.txt
+  object/training/{velodyne,label_2,calib}
+  object/testing/{velodyne,calib}
+```
+
+Notes:
+- Split is auto-created as 80% train / 20% val.
+- `smallval.txt` equals `val.txt`.
+- Dummy calibration files are generated so existing PointRCNN data flow works.
+
+## 4) Config used for custom training
+
+Default config was updated in `tools/cfgs/default.yaml`:
+- `CLASSES: Car,Human,ForkLift,CargoBike,ELFplusplus,FTS`
+- `INCLUDE_SIMILAR_TYPE: False`
+- `RCNN.CLS_WEIGHT` expanded to 7 entries (background + 6 classes)
+
+## 5) Full pipeline data generation (same flow as original repo)
+
+### A) Generate GT database
+
+```bash
+python generate_gt_database_custom.py \
+  --root_dir ../data/dataset \
+  --split train \
+  --class_name Car,Human,ForkLift,CargoBike,ELFplusplus,FTS
+```
+
+This generates:
+- `gt_database/train_gt_database_3level_multi.pkl`
+
+### B) Generate augmented scenes
+
+```bash
+python generate_aug_scene_custom.py \
+  --root_dir data/dataset \
+  --split train \
+  --class_name Car,Human,ForkLift,CargoBike,ELFplusplus,FTS \
+  --gt_database_dir gt_database/train_gt_database_3level_multi.pkl \
+  --aug_times 3
+```
+
+This generates:
+- `data/dataset/KITTI/aug_scene/training/rectified_data/*.bin`
+- `data/dataset/KITTI/aug_scene/training/aug_label/*.txt`
+- `data/dataset/KITTI/ImageSets/train_aug.txt`
+
+If you train with augmented split, set in `tools/cfgs/default.yaml`:
+- `TRAIN.SPLIT: train_aug`
+
+## 6) Train RPN stage
+
+```bash
+cd tools
+python train_rcnn.py \
+  --cfg_file cfgs/default.yaml \
+  --batch_size 8 \
+  --train_mode rpn \
+  --epochs 200 \
+  --data_root ../data/dataset \
+  --gt_database ../gt_database/train_gt_database_3level_multi.pkl
+```
+
+## 7) Train RCNN stage
+
+There are two RCNN training strategies.
+
+### A) Online RCNN training
+
+This is the simpler workflow and uses the fixed RPN checkpoint directly.
+
+```bash
+cd tools
+python train_rcnn.py \
+  --cfg_file cfgs/default.yaml \
+  --batch_size 4 \
+  --train_mode rcnn \
+  --epochs 70 \
+  --rpn_ckpt ../output/rpn/default/ckpt/checkpoint_epoch_200.pth \
+  --data_root ../data/dataset \
+  --gt_database ../gt_database/train_gt_database_3level_multi.pkl
+```
+
+### B) Offline RCNN training (recommended)
+
+The original PointRCNN README notes that the offline augmentation strategy usually gives better results than the online one. For your custom dataset, the equivalent workflow is:
+
+#### Step 1: Generate augmented scenes
+
+From `tools`:
+
+```bash
+cd tools
+python generate_aug_scene.py \
+  --root_dir ../data/dataset \
+  --split train \
+  --class_name Car,Human,ForkLift,CargoBike,ELFplusplus,FTS \
+  --gt_database_dir ../gt_database/train_gt_database_3level_multi.pkl \
+  --aug_times 4
+```
+
+#### Step 2: Save RPN features and proposals for `train_aug`
+
+From `tools`:
+
+```bash
+cd tools
+python eval_rcnn.py \
+  --cfg_file cfgs/default.yaml \
+  --batch_size 4 \
+  --eval_mode rpn \
+  --ckpt ../output/rpn/default/ckpt/checkpoint_epoch_200.pth \
+  --data_root ../data/dataset \
+  --save_rpn_feature \
+  --set TEST.SPLIT train_aug TEST.RPN_POST_NMS_TOP_N 300 TEST.RPN_NMS_THRESH 0.85
+```
+
+If you also want offline evaluation features for validation, run:
+
+```bash
+/home/lenovo/venvs/pointrcnn/bin/python eval_rcnn.py \
+  --cfg_file cfgs/default.yaml \
+  --batch_size 4 \
+  --eval_mode rpn \
+  --ckpt ../output/rpn/default/ckpt/checkpoint_epoch_200.pth \
+  --data_root ../data/dataset \
+  --save_rpn_feature
+```
+
+#### Step 3: Train RCNN with offline proposals
+
+Before running this, set `TRAIN.SPLIT: train_aug` in `tools/cfgs/default.yaml`.
+
+```bash
+cd tools
+python train_rcnn.py \
+  --cfg_file cfgs/default.yaml \
+  --batch_size 4 \
+  --train_mode rcnn_offline \
+  --epochs 30 \
+  --ckpt_save_interval 1 \
+  --data_root ../data/dataset \
+  --gt_database ../gt_database/train_gt_database_3level_multi.pkl \
+  --rcnn_training_roi_dir ../output/rpn/default/eval/epoch_200/train_aug/detections/data \
+  --rcnn_training_feature_dir ../output/rpn/default/eval/epoch_200/train_aug/features
+```
+
+#### Optional: CPU proposal sampling
+
+For the offline workflow, the original repo notes the best model was trained with CPU proposal sampling by setting:
+
+- `RCNN.ROI_SAMPLE_JIT: False`
+
+This can improve results, but it uses more CPU worker time.
+
+## 8) Automatic preprocessing behavior in trainer
+
+`tools/train_rcnn.py` now defaults to:
+- `--data_root ../data/dataset`
+- auto-preprocesses if `data_root/KITTI/ImageSets/<split>.txt` is missing.
+
+If you already preprocessed and want to skip checks:
+
+```bash
+python train_rcnn.py ... --skip_preprocess
+```
+
+## 9) Practical tips
+
+- Start with smaller batch sizes if GPU memory is limited.
+- If you want the strongest RCNN results, prefer the offline RCNN workflow above over the online one.
+- If training is unstable, lower LR in `tools/cfgs/default.yaml`.
+- Keep class names exactly consistent between labels and config.
+- Make sure all `.bin` are `float32` with shape `N x 4` (`x y z intensity`).
+
+## 10) Quick sanity check before long training
+
+
+
+```bash
+
+unset WAYLAND_DISPLAY
+export XDG_SESSION_TYPE=x11
+LIBGL_ALWAYS_SOFTWARE=1 MESA_LOADER_DRIVER_OVERRIDE=llvmpipe GALLIUM_DRIVER=llvmpipe 
+
+/home/lenovo/venvs/pointrcnn/bin/python tools/preprocess_dataset.py --dataset_root data/dataset
+head -n 5 data/dataset/KITTI/ImageSets/train.txt
+ls data/dataset/KITTI/object/training/velodyne | head
+ls data/dataset/KITTI/object/training/label_2 | head
+```
+
+If these files exist and IDs match, you are ready to train.

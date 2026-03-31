@@ -10,7 +10,7 @@ class ProposalLayer(nn.Module):
     def __init__(self, mode='TRAIN'):
         super().__init__()
         self.mode = mode
-        self.MEAN_SIZE = torch.from_numpy(cfg.CLS_MEAN_SIZE[0]).cuda()
+        self.MEAN_SIZE = torch.from_numpy(cfg.CLS_MEAN_SIZE[0]).float()
 
     def forward(self, rpn_scores, rpn_reg, xyz):
         """
@@ -21,7 +21,7 @@ class ProposalLayer(nn.Module):
         """
         batch_size = xyz.shape[0]
         proposals = decode_bbox_target(xyz.view(-1, 3), rpn_reg.view(-1, rpn_reg.shape[-1]),
-                                       anchor_size=self.MEAN_SIZE,
+                                       anchor_size=self.MEAN_SIZE.to(xyz.device),
                                        loc_scope=cfg.RPN.LOC_SCOPE,
                                        loc_bin_size=cfg.RPN.LOC_BIN_SIZE,
                                        num_head_bin=cfg.RPN.NUM_HEAD_BIN,

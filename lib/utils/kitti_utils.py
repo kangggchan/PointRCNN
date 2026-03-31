@@ -63,10 +63,22 @@ def rotate_pc_along_y_torch(pc, rot_angle):
     return pc
 
 
-def boxes3d_to_corners3d(boxes3d, rotate=True):
+def get_boxes3d_format(obj_list):
+    """
+    Detect coordinate format from a list of Object3d.
+    Since preprocess_dataset converts custom yaw to KITTI ry, labels on disk
+    are always in KITTI (y-axis rotation) format.
+    :param obj_list: list of Object3d
+    :return: 'kitti'
+    """
+    return 'kitti'
+
+
+def boxes3d_to_corners3d(boxes3d, rotate=True, format='kitti'):
     """
     :param boxes3d: (N, 7) [x, y, z, h, w, l, ry]
     :param rotate:
+    :param format: 'kitti' (y-axis rotation) or 'custom'/'lidar' (z-axis rotation)
     :return: corners3d: (N, 8, 3)
     """
     boxes_num = boxes3d.shape[0]
@@ -80,9 +92,16 @@ def boxes3d_to_corners3d(boxes3d, rotate=True):
     if rotate:
         ry = boxes3d[:, 6]
         zeros, ones = np.zeros(ry.size, dtype=np.float32), np.ones(ry.size, dtype=np.float32)
-        rot_list = np.array([[np.cos(ry), zeros, -np.sin(ry)],
-                             [zeros,       ones,       zeros],
-                             [np.sin(ry), zeros,  np.cos(ry)]])  # (3, 3, N)
+        if format in ('custom', 'lidar'):
+            # Z-axis rotation (yaw in LiDAR frame)
+            rot_list = np.array([[ np.cos(ry), np.sin(ry), zeros],
+                                  [-np.sin(ry), np.cos(ry), zeros],
+                                  [zeros,        zeros,      ones]])  # (3, 3, N)
+        else:
+            # Y-axis rotation (KITTI ry)
+            rot_list = np.array([[np.cos(ry), zeros, -np.sin(ry)],
+                                 [zeros,       ones,       zeros],
+                                 [np.sin(ry), zeros,  np.cos(ry)]])  # (3, 3, N)
         R_list = np.transpose(rot_list, (2, 0, 1))  # (N, 3, 3)
 
         temp_corners = np.concatenate((x_corners.reshape(-1, 8, 1), y_corners.reshape(-1, 8, 1),

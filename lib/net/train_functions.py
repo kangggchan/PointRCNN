@@ -122,7 +122,7 @@ def model_joint_fn_decorator():
     def get_rcnn_loss(model, ret_dict, tb_dict):
         rcnn_cls, rcnn_reg = ret_dict['rcnn_cls'], ret_dict['rcnn_reg']
 
-        cls_label = ret_dict['cls_label'].float()
+        cls_label = ret_dict['cls_label']
         reg_valid_mask = ret_dict['reg_valid_mask']
         roi_boxes3d = ret_dict['roi_boxes3d']
         roi_size = roi_boxes3d[:, 3:6]
@@ -137,7 +137,25 @@ def model_joint_fn_decorator():
 
         cls_label_flat = cls_label.view(-1)
 
-        if cfg.RCNN.LOSS_CLS == 'SigmoidFocalLoss':
+        if rcnn_cls.dim() > 1 and rcnn_cls.shape[-1] > 1:
+            rcnn_cls_reshape = rcnn_cls.view(-1, rcnn_cls.shape[-1])
+            cls_target = cls_label_flat.long()
+            cls_valid_mask = (cls_target >= 0).float()
+            cls_target_valid = cls_target.clone()
+            cls_target_valid[cls_target_valid < 0] = 0
+
+            cls_weight = None
+            if cfg.RCNN.CLS_WEIGHT is not None:
+                cfg_weight = torch.as_tensor(cfg.RCNN.CLS_WEIGHT, dtype=rcnn_cls_reshape.dtype,
+                                             device=rcnn_cls_reshape.device)
+                if cfg_weight.numel() == rcnn_cls_reshape.shape[1]:
+                    cls_weight = cfg_weight
+
+            batch_loss_cls = F.cross_entropy(rcnn_cls_reshape, cls_target_valid, reduction='none', weight=cls_weight)
+            normalizer = torch.clamp(cls_valid_mask.sum(), min=1.0)
+            rcnn_loss_cls = (batch_loss_cls * cls_valid_mask).sum() / normalizer
+
+        elif cfg.RCNN.LOSS_CLS == 'SigmoidFocalLoss':
             rcnn_cls_flat = rcnn_cls.view(-1)
 
             cls_target = (cls_label_flat > 0).float()
@@ -156,11 +174,12 @@ def model_joint_fn_decorator():
 
         elif cfg.RCNN.LOSS_CLS == 'BinaryCrossEntropy':
             rcnn_cls_flat = rcnn_cls.view(-1)
-            batch_loss_cls = F.binary_cross_entropy(torch.sigmoid(rcnn_cls_flat), cls_label, reduction='none')
+            cls_target = cls_label_flat.float()
+            batch_loss_cls = F.binary_cross_entropy(torch.sigmoid(rcnn_cls_flat), cls_target, reduction='none')
             cls_valid_mask = (cls_label_flat >= 0).float()
             rcnn_loss_cls = (batch_loss_cls * cls_valid_mask).sum() / torch.clamp(cls_valid_mask.sum(), min=1.0)
 
-        elif cfg.TRAIN.LOSS_CLS == 'CrossEntropy':
+        elif cfg.RCNN.LOSS_CLS == 'CrossEntropy':
             rcnn_cls_reshape = rcnn_cls.view(rcnn_cls.shape[0], -1)
             cls_target = cls_label_flat.long()
             cls_valid_mask = (cls_label_flat >= 0).float()

@@ -12,6 +12,13 @@ logging.getLogger(__name__).addHandler(logging.StreamHandler())
 cur_logger = logging.getLogger(__name__)
 
 
+def _torch_load_compat(filename):
+    try:
+        return torch.load(filename, weights_only=False)
+    except TypeError:
+        return torch.load(filename)
+
+
 def set_bn_momentum_default(bn_momentum):
 
     def fn(m):
@@ -78,7 +85,7 @@ def save_checkpoint(state, filename='checkpoint'):
 def load_checkpoint(model=None, optimizer=None, filename='checkpoint', logger=cur_logger):
     if os.path.isfile(filename):
         logger.info("==> Loading from checkpoint '{}'".format(filename))
-        checkpoint = torch.load(filename)
+        checkpoint = _torch_load_compat(filename)
         epoch = checkpoint['epoch'] if 'epoch' in checkpoint.keys() else -1
         it = checkpoint.get('it', 0.0)
         if model is not None and checkpoint['model_state'] is not None:
@@ -95,7 +102,7 @@ def load_checkpoint(model=None, optimizer=None, filename='checkpoint', logger=cu
 def load_part_ckpt(model, filename, logger=cur_logger, total_keys=-1):
     if os.path.isfile(filename):
         logger.info("==> Loading part model from checkpoint '{}'".format(filename))
-        checkpoint = torch.load(filename)
+        checkpoint = _torch_load_compat(filename)
         model_state = checkpoint['model_state']
 
         update_model_state = {key: val for key, val in model_state.items() if key in model.state_dict()}
@@ -169,9 +176,18 @@ class Trainer(object):
 
     def train(self, start_it, start_epoch, n_epochs, train_loader, test_loader=None, ckpt_save_interval=5,
               lr_scheduler_each_iter=False):
+        import csv
         eval_frequency = self.eval_frequency if self.eval_frequency > 0 else 1
 
         it = start_it
+        best_metric = None
+        best_epoch = None
+        best_ckpt_path = None
+        # Prepare CSV log for matplotlib
+        csv_log_path = os.path.join(self.ckpt_dir, 'train_val_history.csv')
+        csv_fields = ['epoch', 'train_loss', 'val_loss', 'val_recall']
+        csv_rows = []
+
         with tqdm.trange(start_epoch, n_epochs, desc='epochs') as tbar, \
                 tqdm.tqdm(total=len(train_loader), leave=False, desc='train') as pbar:
 
@@ -184,6 +200,7 @@ class Trainer(object):
                     self.tb_log.add_scalar('bn_momentum', self.bnm_scheduler.lmbd(epoch), it)
 
                 # train one epoch
+                train_losses = []
                 for cur_it, batch in enumerate(train_loader):
                     if lr_scheduler_each_iter:
                         self.lr_scheduler.step(it)
@@ -197,6 +214,7 @@ class Trainer(object):
                             cur_lr = self.lr_scheduler.get_lr()[0]
 
                     loss, tb_dict, disp_dict = self._train_it(batch)
+                    train_losses.append(loss)
                     it += 1
 
                     disp_dict.update({'loss': loss, 'lr': cur_lr})
@@ -213,6 +231,8 @@ class Trainer(object):
                         for key, val in tb_dict.items():
                             self.tb_log.add_scalar('train_' + key, val, it)
 
+                avg_train_loss = sum(train_losses) / max(len(train_losses), 1)
+
                 # save trained model
                 trained_epoch = epoch + 1
                 if trained_epoch % ckpt_save_interval == 0:
@@ -222,6 +242,8 @@ class Trainer(object):
                     )
 
                 # eval one epoch
+                val_loss = None
+                val_recall = None
                 if (epoch % eval_frequency) == 0:
                     pbar.close()
                     if test_loader is not None:
@@ -233,8 +255,36 @@ class Trainer(object):
                             for key, val in eval_dict.items():
                                 self.tb_log.add_scalar('val_' + key, val, it)
 
+                        # Save best checkpoint by recall (or lowest val_loss if recall not present)
+                        metric = eval_dict.get('recall', None)
+                        if metric is None:
+                            metric = -val_loss if val_loss is not None else None
+                        if best_metric is None or (metric is not None and metric > best_metric):
+                            best_metric = metric
+                            best_epoch = trained_epoch
+                            best_ckpt_path = os.path.join(self.ckpt_dir, 'best.pth')
+                            save_checkpoint(
+                                checkpoint_state(self.model, self.optimizer, trained_epoch, it), filename=best_ckpt_path
+                            )
+                        val_recall = eval_dict.get('recall', None)
+
+                # Log to CSV for matplotlib
+                csv_rows.append({
+                    'epoch': trained_epoch,
+                    'train_loss': avg_train_loss,
+                    'val_loss': val_loss if val_loss is not None else '',
+                    'val_recall': val_recall if val_recall is not None else ''
+                })
+
                 pbar.close()
                 pbar = tqdm.tqdm(total=len(train_loader), leave=False, desc='train')
                 pbar.set_postfix(dict(total_it=it))
+
+        # Write CSV log at end
+        with open(csv_log_path, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=csv_fields)
+            writer.writeheader()
+            for row in csv_rows:
+                writer.writerow(row)
 
         return None

@@ -10,6 +10,11 @@ from lib.config import cfg
 
 
 class KittiRCNNDataset(KittiDataset):
+    @staticmethod
+    def parse_classes(class_name):
+        """Parse a comma-separated class name string into a list of class names."""
+        return [c.strip() for c in class_name.split(',') if c.strip()]
+
     def __init__(self, root_dir, npoints=16384, split='train', classes='Car', mode='TRAIN', random_select=True,
                  logger=None, rcnn_training_roi_dir=None, rcnn_training_feature_dir=None, rcnn_eval_roi_dir=None,
                  rcnn_eval_feature_dir=None, gt_database_dir=None):
@@ -19,6 +24,7 @@ class KittiRCNNDataset(KittiDataset):
             aug_scene_root_dir = os.path.join(root_dir, 'KITTI', 'aug_scene')
         elif classes == 'People':
             self.classes = ('Background', 'Pedestrian', 'Cyclist')
+            aug_scene_root_dir = os.path.join(root_dir, 'KITTI', 'aug_scene')
         elif classes == 'Pedestrian':
             self.classes = ('Background', 'Pedestrian')
             aug_scene_root_dir = os.path.join(root_dir, 'KITTI', 'aug_scene_ped')
@@ -26,7 +32,10 @@ class KittiRCNNDataset(KittiDataset):
             self.classes = ('Background', 'Cyclist')
             aug_scene_root_dir = os.path.join(root_dir, 'KITTI', 'aug_scene_cyclist')
         else:
-            assert False, "Invalid classes: %s" % classes
+            # Custom multi-class: comma-separated string or already a list/tuple
+            class_list = self.parse_classes(classes) if isinstance(classes, str) else list(classes)
+            self.classes = tuple(['Background'] + class_list)
+            aug_scene_root_dir = os.path.join(root_dir, 'KITTI', 'aug_scene')
 
         self.num_class = self.classes.__len__()
 
@@ -103,24 +112,42 @@ class KittiRCNNDataset(KittiDataset):
         Valid sample_id is stored in self.sample_id_list
         """
         self.logger.info('Loading %s samples from %s ...' % (self.mode, self.label_dir))
+        
+        # Detect format once (from first valid sample)
+        format_detected = False
+        
         for idx in range(0, self.num_sample):
             sample_id = int(self.image_idx_list[idx])
             obj_list = self.filtrate_objects(self.get_label(sample_id))
             if len(obj_list) == 0:
                 # self.logger.info('No gt classes: %06d' % sample_id)
                 continue
+            
+            # Detect format from first valid sample (one-time only)
+            if not format_detected:
+                self.boxes3d_format = kitti_utils.get_boxes3d_format(obj_list)
+                format_detected = True
+                self.logger.info('Detected boxes3d format: %s' % self.boxes3d_format)
+            
             self.sample_id_list.append(sample_id)
 
         self.logger.info('Done: filter %s results: %d / %d\n' % (self.mode, len(self.sample_id_list),
                                                                  len(self.image_idx_list)))
 
     def get_label(self, idx):
-        if idx < 10000:
-            label_file = os.path.join(self.label_dir, '%06d.txt' % idx)
+        # For train_aug split: samples come from BOTH label_2 (originals) and aug_label (augmented)
+        # Try label_2 first (original train samples), then aug_label (augmented samples)
+        if 'train_aug' in self.split:
+            # Try original label_2 directory first
+            label_file = os.path.join(self.imageset_dir, 'label_2', '%06d.txt' % idx)
+            if not os.path.exists(label_file):
+                # Fall back to aug_label for augmented samples
+                label_file = os.path.join(self.aug_label_dir, '%06d.txt' % idx)
         else:
-            label_file = os.path.join(self.aug_label_dir, '%06d.txt' % idx)
-
-        assert os.path.exists(label_file)
+            # For non-train_aug splits: use standard label_2 or aug_label based on ID
+            label_file = os.path.join(self.label_dir, '%06d.txt' % idx)
+        
+        assert os.path.exists(label_file), f"Label file not found: {label_file}"
         return kitti_utils.get_objects_from_label(label_file)
 
     def get_image(self, idx):
@@ -165,6 +192,8 @@ class KittiRCNNDataset(KittiDataset):
 
         valid_obj_list = []
         for obj in obj_list:
+            if obj.cls_type.lower() in ['box', 'boxes', 'bbox']:
+                continue
             if obj.cls_type not in type_whitelist:  # rm Van, 20180928
                 continue
             if self.mode == 'TRAIN' and cfg.PC_REDUCE_BY_RANGE and (self.check_pc_range(obj.pos) is False):
@@ -264,8 +293,14 @@ class KittiRCNNDataset(KittiDataset):
             aug_pts = np.fromfile(pts_file, dtype=np.float32).reshape(-1, 4)
             pts_rect, pts_intensity = aug_pts[:, 0:3], aug_pts[:, 3]
 
-        pts_img, pts_rect_depth = calib.rect_to_img(pts_rect)
-        pts_valid_flag = self.get_valid_flag(pts_rect, pts_img, pts_rect_depth, img_shape)
+            # For augmented samples, points are already in correct 3D coordinate frame
+            # Do NOT apply image projection - just use all points (no filtering needed)
+            # since augmented data is already pre-processed in 3D space
+            pts_valid_flag = np.ones(pts_rect.shape[0], dtype=bool)
+
+        if sample_id < 10000:
+            pts_img, pts_rect_depth = calib.rect_to_img(pts_rect)
+            pts_valid_flag = self.get_valid_flag(pts_rect, pts_img, pts_rect_depth, img_shape)
 
         pts_rect = pts_rect[pts_valid_flag][:, 0:3]
         pts_intensity = pts_intensity[pts_valid_flag]
@@ -283,25 +318,50 @@ class KittiRCNNDataset(KittiDataset):
 
         # generate inputs
         if self.mode == 'TRAIN' or self.random_select:
-            if self.npoints < len(pts_rect):
+            num_pts = len(pts_rect)
+            if num_pts == 0:
+                ret_pts_rect = np.zeros((self.npoints, 3), dtype=np.float32)
+                ret_pts_intensity = np.zeros((self.npoints,), dtype=np.float32)
+            elif self.npoints < num_pts:
                 pts_depth = pts_rect[:, 2]
                 pts_near_flag = pts_depth < 40.0
                 far_idxs_choice = np.where(pts_near_flag == 0)[0]
                 near_idxs = np.where(pts_near_flag == 1)[0]
-                near_idxs_choice = np.random.choice(near_idxs, self.npoints - len(far_idxs_choice), replace=False)
 
-                choice = np.concatenate((near_idxs_choice, far_idxs_choice), axis=0) \
-                    if len(far_idxs_choice) > 0 else near_idxs_choice
+                near_need = max(self.npoints - len(far_idxs_choice), 0)
+                if near_need > 0:
+                    if len(near_idxs) > 0:
+                        near_idxs_choice = np.random.choice(near_idxs, near_need,
+                                                            replace=(near_need > len(near_idxs)))
+                    else:
+                        near_idxs_choice = np.random.choice(far_idxs_choice, near_need,
+                                                            replace=(near_need > len(far_idxs_choice)))
+                else:
+                    near_idxs_choice = np.array([], dtype=np.int32)
+
+                if len(far_idxs_choice) > 0:
+                    choice = np.concatenate((near_idxs_choice, far_idxs_choice), axis=0)
+                else:
+                    choice = near_idxs_choice
+
+                if len(choice) < self.npoints:
+                    pad_choice = np.random.choice(choice, self.npoints - len(choice), replace=True)
+                    choice = np.concatenate((choice, pad_choice), axis=0)
+                elif len(choice) > self.npoints:
+                    choice = np.random.choice(choice, self.npoints, replace=False)
+
                 np.random.shuffle(choice)
+                ret_pts_rect = pts_rect[choice, :]
+                ret_pts_intensity = pts_intensity[choice] - 0.5  # translate intensity to [-0.5, 0.5]
             else:
-                choice = np.arange(0, len(pts_rect), dtype=np.int32)
-                if self.npoints > len(pts_rect):
-                    extra_choice = np.random.choice(choice, self.npoints - len(pts_rect), replace=False)
+                choice = np.arange(0, num_pts, dtype=np.int32)
+                if self.npoints > num_pts:
+                    extra_choice = np.random.choice(choice, self.npoints - num_pts, replace=True)
                     choice = np.concatenate((choice, extra_choice), axis=0)
                 np.random.shuffle(choice)
 
-            ret_pts_rect = pts_rect[choice, :]
-            ret_pts_intensity = pts_intensity[choice] - 0.5  # translate intensity to [-0.5, 0.5]
+                ret_pts_rect = pts_rect[choice, :]
+                ret_pts_intensity = pts_intensity[choice] - 0.5  # translate intensity to [-0.5, 0.5]
         else:
             ret_pts_rect = pts_rect
             ret_pts_intensity = pts_intensity - 0.5
@@ -325,6 +385,7 @@ class KittiRCNNDataset(KittiDataset):
         if cfg.GT_AUG_ENABLED and self.mode == 'TRAIN' and gt_aug_flag:
             gt_obj_list.extend(extra_gt_obj_list)
         gt_boxes3d = kitti_utils.objs_to_boxes3d(gt_obj_list)
+        # Use pre-detected format (detected once during init, not per-batch)
 
         gt_alpha = np.zeros((gt_obj_list.__len__()), dtype=np.float32)
         for k, obj in enumerate(gt_obj_list):
@@ -351,8 +412,8 @@ class KittiRCNNDataset(KittiDataset):
             sample_info['gt_boxes3d'] = aug_gt_boxes3d
             return sample_info
 
-        # generate training labels
-        rpn_cls_label, rpn_reg_label = self.generate_rpn_training_labels(aug_pts_rect, aug_gt_boxes3d)
+        # generate training labels (using pre-detected format)
+        rpn_cls_label, rpn_reg_label = self.generate_rpn_training_labels(aug_pts_rect, aug_gt_boxes3d, self.boxes3d_format)
         sample_info['pts_input'] = pts_input
         sample_info['pts_rect'] = aug_pts_rect
         sample_info['pts_features'] = ret_pts_features
@@ -362,12 +423,12 @@ class KittiRCNNDataset(KittiDataset):
         return sample_info
 
     @staticmethod
-    def generate_rpn_training_labels(pts_rect, gt_boxes3d):
+    def generate_rpn_training_labels(pts_rect, gt_boxes3d, boxes3d_format='kitti'):
         cls_label = np.zeros((pts_rect.shape[0]), dtype=np.int32)
         reg_label = np.zeros((pts_rect.shape[0], 7), dtype=np.float32)  # dx, dy, dz, ry, h, w, l
-        gt_corners = kitti_utils.boxes3d_to_corners3d(gt_boxes3d, rotate=True)
+        gt_corners = kitti_utils.boxes3d_to_corners3d(gt_boxes3d, rotate=True, format=boxes3d_format)
         extend_gt_boxes3d = kitti_utils.enlarge_box3d(gt_boxes3d, extra_width=0.2)
-        extend_gt_corners = kitti_utils.boxes3d_to_corners3d(extend_gt_boxes3d, rotate=True)
+        extend_gt_corners = kitti_utils.boxes3d_to_corners3d(extend_gt_boxes3d, rotate=True, format=boxes3d_format)
         for k in range(gt_boxes3d.shape[0]):
             box_corners = gt_corners[k]
             fg_pt_flag = kitti_utils.in_hull(pts_rect, box_corners)
@@ -1001,7 +1062,15 @@ class KittiRCNNDataset(KittiDataset):
         reg_valid_mask = (iou_of_rois > cfg.RCNN.REG_FG_THRESH).astype(np.int32) & valid_mask
 
         # classification label
-        cls_label = (iou_of_rois > cfg.RCNN.CLS_FG_THRESH).astype(np.int32)
+        cls_label = np.zeros(rois.shape[0], dtype=np.int32) - 1  # -1 for invalid
+        for i, gt_idx in enumerate(gt_assignment):
+            if max_overlaps[i] > cfg.RCNN.CLS_FG_THRESH:
+                cls_obj = gt_obj_list[gt_idx]
+                cls_label[i] = self.classes.index(cls_obj.cls_type)  # 0-6 based on class
+            elif max_overlaps[i] > cfg.RCNN.CLS_BG_THRESH:
+                cls_label[i] = -1  # Unknown/don't care
+            else:
+                cls_label[i] = 0  # Background
         invalid_mask = (iou_of_rois > cfg.RCNN.CLS_BG_THRESH) & (iou_of_rois < cfg.RCNN.CLS_FG_THRESH)
         cls_label[invalid_mask] = -1
         cls_label[valid_mask == 0] = -1
