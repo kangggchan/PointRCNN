@@ -26,8 +26,6 @@ CLASS_COLORS = {
     'human': (0.1, 0.85, 0.25),
     'forklift': (1.0, 0.2, 0.2),
     'cargobike': (0.15, 0.55, 1.0),
-    'elfplusplus': (1.0, 0.9, 0.2),
-    'fts': (0.95, 0.2, 0.8),
 }
 
 BOX_EDGES = [

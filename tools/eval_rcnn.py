@@ -154,7 +154,14 @@ def eval_one_epoch_rpn(model, dataloader, epoch_id, result_dir, logger):
 
     thresh_list = [0.1, 0.3, 0.5, 0.7, 0.9]
     total_recalled_bbox_list, total_gt_bbox = [0] * 5, 0
+    
+    # Per-class tracking
     dataset = dataloader.dataset
+    num_classes = dataset.num_class - 1  # Exclude background
+    class_names = dataset.classes[1:]  # Exclude background
+    per_class_recalled_bbox_list = [[0] * 5 for _ in range(num_classes)]
+    per_class_gt_bbox = [0] * num_classes
+    
     cnt = max_num = rpn_iou_avg = 0
 
     progress_bar = tqdm.tqdm(total=len(dataloader), leave=True, desc='eval')
@@ -212,13 +219,28 @@ def eval_one_epoch_rpn(model, dataloader, epoch_id, result_dir, logger):
 
                 recalled_num = 0
                 if cur_gt_boxes3d.shape[0] > 0:
+                    # Get ground truth labels for per-class recall tracking
+                    gt_labels = dataset.get_label(cur_sample_id)
+                    gt_class_ids = np.array([dataset.classes.index(label.cls_type) - 1 for label in gt_labels
+                                            if label.cls_type in dataset.classes])  # -1 to exclude background
+                    
                     iou3d = iou3d_utils.boxes_iou3d_gpu(cur_boxes3d, cur_gt_boxes3d[:, 0:7])
                     gt_max_iou, _ = iou3d.max(dim=0)
 
                     for idx, thresh in enumerate(thresh_list):
                         total_recalled_bbox_list[idx] += (gt_max_iou > thresh).sum().item()
+                        # Per-class recall
+                        for class_idx in range(num_classes):
+                            class_mask = gt_class_ids == class_idx
+                            if class_mask.sum() > 0:
+                                per_class_recalled_bbox_list[class_idx][idx] += (gt_max_iou[class_mask] > thresh).sum().item()
+                    
                     recalled_num = (gt_max_iou > 0.7).sum().item()
                     total_gt_bbox += cur_gt_boxes3d.__len__()
+                    
+                    # Per-class GT count
+                    for class_idx in range(num_classes):
+                        per_class_gt_bbox[class_idx] += (gt_class_ids == class_idx).sum()
 
                 fg_mask = cur_rpn_cls_label > 0
                 correct = ((cur_seg_result == cur_rpn_cls_label) & fg_mask).sum().float()
@@ -281,6 +303,31 @@ def eval_one_epoch_rpn(model, dataloader, epoch_id, result_dir, logger):
         logger.info('total bbox recall(thresh=%.3f): %d / %d = %f' % (thresh, total_recalled_bbox_list[idx],
                     total_gt_bbox, cur_recall))
         ret_dict['rpn_recall(thresh=%.2f)' % thresh] = cur_recall
+    
+    # Log and save per-class recall
+    logger.info('-------------------per-class recall---------------------')
+    per_class_recall_file = os.path.join(result_dir, 'per_class_recall_epoch_%s.csv' % epoch_id)
+    with open(per_class_recall_file, 'w') as f:
+        # CSV header
+        f.write('class_name,gt_count,' + ','.join(['recall@%.1f' % t for t in thresh_list]) + '\n')
+        
+        for class_idx in range(num_classes):
+            class_name = class_names[class_idx]
+            logger.info('\n%s (total GT: %d):' % (class_name, per_class_gt_bbox[class_idx]))
+            
+            csv_line = '%s,%d' % (class_name, per_class_gt_bbox[class_idx])
+            for idx, thresh in enumerate(thresh_list):
+                if per_class_gt_bbox[class_idx] > 0:
+                    class_recall = per_class_recalled_bbox_list[class_idx][idx] / per_class_gt_bbox[class_idx]
+                else:
+                    class_recall = 0.0
+                logger.info('  recall(thresh=%.3f): %d / %d = %.4f' % (thresh, per_class_recalled_bbox_list[class_idx][idx],
+                           per_class_gt_bbox[class_idx], class_recall))
+                csv_line += ',%.4f' % class_recall
+                ret_dict['rpn_recall_%s(thresh=%.2f)' % (class_name, thresh)] = class_recall
+            f.write(csv_line + '\n')
+    
+    logger.info('\nPer-class recall saved to: %s' % per_class_recall_file)
     logger.info('result is saved to: %s' % result_dir)
 
     return ret_dict
@@ -307,6 +354,14 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
     total_recalled_bbox_list, total_gt_bbox = [0] * 5, 0
     total_roi_recalled_bbox_list = [0] * 5
     dataset = dataloader.dataset
+    
+    # Per-class tracking for RCNN
+    num_classes = dataset.num_class - 1  # Exclude background
+    class_names = dataset.classes[1:]  # Exclude background
+    per_class_recalled_bbox_list = [[0] * 5 for _ in range(num_classes)]
+    per_class_roi_recalled_bbox_list = [[0] * 5 for _ in range(num_classes)]
+    per_class_gt_bbox = [0] * num_classes
+    
     cnt = final_total = total_cls_acc = total_cls_acc_refined = 0
 
     progress_bar = tqdm.tqdm(total=len(dataloader), leave=True, desc='eval')
@@ -369,20 +424,40 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
             # calculate recall
             gt_num = gt_boxes3d.shape[0]
             if gt_num > 0:
+                # Get ground truth labels for per-class recall tracking
+                gt_labels = dataset.get_label(sample_id)
+                gt_class_ids = np.array([dataset.classes.index(label.cls_type) - 1 for label in gt_labels
+                                        if label.cls_type in dataset.classes])  # -1 to exclude background
+                
                 iou3d = iou3d_utils.boxes_iou3d_gpu(pred_boxes3d, gt_boxes3d)
                 gt_max_iou, _ = iou3d.max(dim=0)
                 refined_iou, _ = iou3d.max(dim=1)
 
                 for idx, thresh in enumerate(thresh_list):
                     total_recalled_bbox_list[idx] += (gt_max_iou > thresh).sum().item()
+                    # Per-class recall
+                    for class_idx in range(num_classes):
+                        class_mask = gt_class_ids == class_idx
+                        if class_mask.sum() > 0:
+                            per_class_recalled_bbox_list[class_idx][idx] += (gt_max_iou[class_mask] > thresh).sum().item()
+                
                 recalled_num = (gt_max_iou > 0.7).sum().item()
                 total_gt_bbox += gt_num
+                
+                # Per-class GT count
+                for class_idx in range(num_classes):
+                    per_class_gt_bbox[class_idx] += (gt_class_ids == class_idx).sum()
 
                 iou3d_in = iou3d_utils.boxes_iou3d_gpu(roi_boxes3d, gt_boxes3d)
                 gt_max_iou_in, _ = iou3d_in.max(dim=0)
 
                 for idx, thresh in enumerate(thresh_list):
                     total_roi_recalled_bbox_list[idx] += (gt_max_iou_in > thresh).sum().item()
+                    # Per-class ROI recall
+                    for class_idx in range(num_classes):
+                        class_mask = gt_class_ids == class_idx
+                        if class_mask.sum() > 0:
+                            per_class_roi_recalled_bbox_list[class_idx][idx] += (gt_max_iou_in[class_mask] > thresh).sum().item()
 
             # classification accuracy
             cls_label = (gt_iou > cfg.RCNN.CLS_FG_THRESH).float()
@@ -476,6 +551,31 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
                                                                       total_gt_bbox, cur_recall))
         ret_dict['rcnn_recall(thresh=%.2f)' % thresh] = cur_recall
 
+    # Log and save per-class recall for RCNN
+    logger.info('-------------------per-class recall (refined boxes)---------------------')
+    per_class_recall_file = os.path.join(result_dir, 'per_class_recall_epoch_%s.csv' % epoch_id)
+    with open(per_class_recall_file, 'w') as f:
+        # CSV header
+        f.write('class_name,gt_count,' + ','.join(['recall@%.1f' % t for t in thresh_list]) + '\n')
+        
+        for class_idx in range(num_classes):
+            class_name = class_names[class_idx]
+            logger.info('\n%s (total GT: %d):' % (class_name, per_class_gt_bbox[class_idx]))
+            
+            csv_line = '%s,%d' % (class_name, per_class_gt_bbox[class_idx])
+            for idx, thresh in enumerate(thresh_list):
+                if per_class_gt_bbox[class_idx] > 0:
+                    class_recall = per_class_recalled_bbox_list[class_idx][idx] / per_class_gt_bbox[class_idx]
+                else:
+                    class_recall = 0.0
+                logger.info('  recall(thresh=%.3f): %d / %d = %.4f' % (thresh, per_class_recalled_bbox_list[class_idx][idx],
+                           per_class_gt_bbox[class_idx], class_recall))
+                csv_line += ',%.4f' % class_recall
+                ret_dict['rcnn_recall_%s(thresh=%.2f)' % (class_name, thresh)] = class_recall
+            f.write(csv_line + '\n')
+    
+    logger.info('\nPer-class recall saved to: %s' % per_class_recall_file)
+
     if cfg.TEST.SPLIT != 'test':
         logger.info('Averate Precision:')
         name_to_class = {'Car': 0, 'Pedestrian': 1, 'Cyclist': 2}
@@ -513,6 +613,14 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
     total_recalled_bbox_list, total_gt_bbox = [0] * 5, 0
     total_roi_recalled_bbox_list = [0] * 5
     dataset = dataloader.dataset
+    
+    # Per-class tracking for joint evaluation
+    num_classes = dataset.num_class - 1  # Exclude background
+    class_names = dataset.classes[1:]  # Exclude background
+    per_class_recalled_bbox_list = [[0] * 5 for _ in range(num_classes)]
+    per_class_roi_recalled_bbox_list = [[0] * 5 for _ in range(num_classes)]
+    per_class_gt_bbox = [0] * num_classes
+    
     cnt = final_total = total_cls_acc = total_cls_acc_refined = total_rpn_iou = 0
 
     progress_bar = tqdm.tqdm(total=len(dataloader), leave=True, desc='eval')
@@ -571,6 +679,7 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
 
             for k in range(batch_size):
                 # calculate recall
+                cur_sample_id = sample_id[k]
                 cur_gt_boxes3d = gt_boxes3d[k]
                 tmp_idx = cur_gt_boxes3d.__len__() - 1
 
@@ -585,11 +694,26 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
                     gt_max_iou, _ = iou3d.max(dim=0)
                     refined_iou, _ = iou3d.max(dim=1)
 
+                    # Get ground truth labels for per-class recall tracking
+                    gt_labels = dataset.get_label(cur_sample_id)
+                    gt_class_ids = np.array([dataset.classes.index(label.cls_type) - 1 for label in gt_labels
+                                            if label.cls_type in dataset.classes])  # -1 to exclude background
+
                     for idx, thresh in enumerate(thresh_list):
                         total_recalled_bbox_list[idx] += (gt_max_iou > thresh).sum().item()
+                        # Per-class recall
+                        for class_idx in range(num_classes):
+                            class_mask = gt_class_ids == class_idx
+                            if class_mask.sum() > 0:
+                                per_class_recalled_bbox_list[class_idx][idx] += (gt_max_iou[class_mask] > thresh).sum().item()
+                    
                     recalled_num += (gt_max_iou > 0.7).sum().item()
                     gt_num += cur_gt_boxes3d.shape[0]
                     total_gt_bbox += cur_gt_boxes3d.shape[0]
+                    
+                    # Per-class GT count
+                    for class_idx in range(num_classes):
+                        per_class_gt_bbox[class_idx] += (gt_class_ids == class_idx).sum()
 
                     # original recall
                     iou3d_in = iou3d_utils.boxes_iou3d_gpu(roi_boxes3d[k], cur_gt_boxes3d)
@@ -597,6 +721,11 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
 
                     for idx, thresh in enumerate(thresh_list):
                         total_roi_recalled_bbox_list[idx] += (gt_max_iou_in > thresh).sum().item()
+                        # Per-class ROI recall
+                        for class_idx in range(num_classes):
+                            class_mask = gt_class_ids == class_idx
+                            if class_mask.sum() > 0:
+                                per_class_roi_recalled_bbox_list[class_idx][idx] += (gt_max_iou_in[class_mask] > thresh).sum().item()
 
                 if not cfg.RPN.FIXED:
                     fg_mask = rpn_cls_label > 0
@@ -703,6 +832,31 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
         logger.info('total bbox recall(thresh=%.3f): %d / %d = %f' % (thresh, total_recalled_bbox_list[idx],
                                                                       total_gt_bbox, cur_recall))
         ret_dict['rcnn_recall(thresh=%.2f)' % thresh] = cur_recall
+
+    # Log and save per-class recall for joint evaluation
+    logger.info('-------------------per-class recall (refined boxes)---------------------')
+    per_class_recall_file = os.path.join(result_dir, 'per_class_recall_epoch_%s.csv' % epoch_id)
+    with open(per_class_recall_file, 'w') as f:
+        # CSV header
+        f.write('class_name,gt_count,' + ','.join(['recall@%.1f' % t for t in thresh_list]) + '\n')
+        
+        for class_idx in range(num_classes):
+            class_name = class_names[class_idx]
+            logger.info('\n%s (total GT: %d):' % (class_name, per_class_gt_bbox[class_idx]))
+            
+            csv_line = '%s,%d' % (class_name, per_class_gt_bbox[class_idx])
+            for idx, thresh in enumerate(thresh_list):
+                if per_class_gt_bbox[class_idx] > 0:
+                    class_recall = per_class_recalled_bbox_list[class_idx][idx] / per_class_gt_bbox[class_idx]
+                else:
+                    class_recall = 0.0
+                logger.info('  recall(thresh=%.3f): %d / %d = %.4f' % (thresh, per_class_recalled_bbox_list[class_idx][idx],
+                           per_class_gt_bbox[class_idx], class_recall))
+                csv_line += ',%.4f' % class_recall
+                ret_dict['rcnn_recall_%s(thresh=%.2f)' % (class_name, thresh)] = class_recall
+            f.write(csv_line + '\n')
+    
+    logger.info('\nPer-class recall saved to: %s' % per_class_recall_file)
 
     if cfg.TEST.SPLIT != 'test':
         logger.info('Averate Precision:')

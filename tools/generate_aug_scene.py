@@ -11,6 +11,7 @@ import lib.utils.roipool3d.roipool3d_utils as roipool3d_utils
 import lib.utils.iou3d.iou3d_utils as iou3d_utils
 from lib.datasets.kitti_dataset import KittiDataset
 from lib.datasets.kitti_rcnn_dataset import KittiRCNNDataset
+from lib.config import cfg
 from tools.preprocess_dataset import preprocess_dataset
 
 np.random.seed(1024)
@@ -36,6 +37,45 @@ def _resolve_path(path_value):
 
 def _parse_classes(class_name):
     return KittiRCNNDataset.parse_classes(class_name)
+
+
+def _parse_class_weights(weight_str, class_names):
+    """
+    Parse class weights from string format.
+    
+    Args:
+        weight_str: String in format "Class1:weight1,Class2:weight2,..." or "weight1,weight2,..." (positional)
+        class_names: List of class names to map weights to
+    
+    Returns:
+        Dict mapping class names to weights, or None if parsing fails
+    """
+    if weight_str is None:
+        return None
+    
+    class_weights = {}
+    pairs = weight_str.split(',')
+    
+    try:
+        # Check if format is "Class:weight" or just "weight"
+        if ':' in pairs[0]:
+            # Named format: "Car:1.1,Human:0.5,..."
+            for pair in pairs:
+                cls, weight = pair.split(':')
+                cls = cls.strip()
+                class_weights[cls] = float(weight.strip())
+        else:
+            # Positional format: "1.1,0.5,1.8,1.8"
+            weights = [float(w.strip()) for w in pairs]
+            if len(weights) != len(class_names):
+                print(f'Error: Expected {len(class_names)} weights, got {len(weights)}')
+                return None
+            class_weights = {cls: w for cls, w in zip(class_names, weights)}
+    except (ValueError, IndexError) as e:
+        print(f'Error parsing class weights: {e}')
+        return None
+    
+    return class_weights if class_weights else None
 
 
 def _get_pc_scope(class_list):
@@ -73,23 +113,24 @@ def save_kitti_format(calib, bbox3d, obj_list, img_shape, save_fp):
 
 
 class AugSceneGenerator(KittiDataset):
-    def __init__(self, root_dir, gt_database, split, classes, use_weighted_sampling=True):
+    def __init__(self, root_dir, gt_database, split, classes, use_weighted_sampling=True, manual_class_weights=None):
         super().__init__(root_dir, split=split)
         class_list = _parse_classes(classes)
         self.classes = tuple(['Background'] + class_list)
         self.pc_area_scope = _get_pc_scope(class_list)
         self.gt_database = gt_database
         self.use_weighted_sampling = use_weighted_sampling
+        self.manual_class_weights = manual_class_weights  # Optional: manually specified weights
         self._setup_class_sampling()
 
     def _setup_class_sampling(self):
-        """Set up weighted sampling based on class distribution in GT database"""
+        """Set up weighted sampling based on class distribution in GT database or config"""
         if not self.use_weighted_sampling:
             self.class_weights = None
             self.class_indices = None
             return
         
-        # Count objects per class
+        # Count objects per class in GT database
         class_counts = {}
         class_indices = {}
         for idx, gt_dict in enumerate(self.gt_database):
@@ -100,20 +141,39 @@ class AugSceneGenerator(KittiDataset):
             class_counts[cls_type] += 1
             class_indices[cls_type].append(idx)
         
-        # Calculate inverse frequency weights (lower frequency = higher weight)
-        total_count = sum(class_counts.values())
-        class_weights = {}
-        for cls_type, count in class_counts.items():
-            # Inverse frequency weight
-            class_weights[cls_type] = total_count / (len(class_counts) * count)
+        # Determine which weights to use
+        if self.manual_class_weights is not None:
+            # Priority 1: Manual weights from command line
+            class_weights = self.manual_class_weights
+            print(f'Using manual class weights (from --class_weights):')
+            for cls_type, weight in sorted(class_weights.items()):
+                print(f'  {cls_type}: {weight:.4f}')
+        else:
+            # Priority 2: Config weights if available
+            try:
+                class_list = list(self.classes[1:])  # Skip 'Background'
+                config_weights = cfg.RPN.CLS_WEIGHT[1:]  # Skip background weight at index 0
+                
+                if len(config_weights) == len(class_list):
+                    class_weights = {cls: float(w) for cls, w in zip(class_list, config_weights)}
+                    print(f'Using class weights from config (lib/config.py):')
+                    for cls_type, weight in sorted(class_weights.items()):
+                        print(f'  {cls_type}: {weight:.4f}')
+                else:
+                    raise ValueError(f'Config weights length mismatch: {len(config_weights)} vs {len(class_list)}')
+            except (AttributeError, ValueError, TypeError):
+                # Fallback: Auto-calculate from GT database
+                total_count = sum(class_counts.values())
+                class_weights = {}
+                for cls_type, count in class_counts.items():
+                    class_weights[cls_type] = total_count / (len(class_counts) * count)
+                print(f'Using auto-calculated weights from GT database:')
+                for cls_type, count in sorted(class_counts.items()):
+                    print(f'  {cls_type}: {count} samples (weight: {class_weights[cls_type]:.4f})')
         
         self.class_counts = class_counts
         self.class_indices = class_indices
         self.class_weights = class_weights
-        
-        print(f'Class distribution in GT database:')
-        for cls_type, count in sorted(class_counts.items()):
-            print(f'  {cls_type}: {count} (weight: {class_weights[cls_type]:.4f})')
 
     def _sample_gt_object(self):
         """Sample a GT object, with weighted sampling if enabled"""
@@ -179,7 +239,7 @@ class AugSceneGenerator(KittiDataset):
             new_gt_obj = new_gt_dict['obj']
             center = new_gt_box3d[0:3]
 
-            if not self.check_pc_range(center) or len(new_gt_points) < 5:
+            if not self.check_pc_range(center):
                 continue
             if cnt > extra_gt_num:
                 break
@@ -279,7 +339,7 @@ class AugSceneGenerator(KittiDataset):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='generator')
-    parser.add_argument('--class_name', type=str, default='Car,Human,ForkLift,CargoBike,ELFplusplus,FTS')
+    parser.add_argument('--class_name', type=str, default='Car,Human,ForkLift,CargoBike')
     parser.add_argument('--root_dir', type=str, default='../data/dataset')
     parser.add_argument('--save_dir', type=str, default=None)
     parser.add_argument('--split', type=str, default='train')
@@ -288,6 +348,8 @@ def main():
     parser.add_argument('--skip_preprocess', action='store_true', default=False)
     parser.add_argument('--weighted_sampling', action='store_true', default=True, 
                         help='Use weighted sampling to balance class distribution during augmentation')
+    parser.add_argument('--class_weights', type=str, default=None,
+                        help='Manual class weights. Format: "Car:1.1,Human:0.5,ForkLift:1.8,CargoBike:1.8" or "1.1,0.5,1.8,1.8"')
     args = parser.parse_args()
 
     root_dir_abs = _resolve_path(args.root_dir)
@@ -306,9 +368,17 @@ def main():
     if not os.path.exists(args.gt_database_dir):
         raise FileNotFoundError(f'gt_database file not found: {args.gt_database_dir}')
 
+    # Parse manual class weights if provided
+    manual_class_weights = None
+    if args.class_weights:
+        manual_class_weights = _parse_class_weights(args.class_weights, class_list)
+        if manual_class_weights is None:
+            print('Warning: Failed to parse class weights, using auto-calculated weights')
+
     gt_database = pickle.load(open(args.gt_database_dir, 'rb'))
     dataset = AugSceneGenerator(root_dir=root_dir_abs, gt_database=gt_database, split=args.split, 
-                                classes=args.class_name, use_weighted_sampling=args.weighted_sampling)
+                                classes=args.class_name, use_weighted_sampling=args.weighted_sampling,
+                                manual_class_weights=manual_class_weights)
     imagesets_dir = os.path.join(root_dir_abs, 'KITTI', 'ImageSets')
     dataset.generate_aug_scene(args.split, args.aug_times, args.save_dir, imagesets_dir)
 

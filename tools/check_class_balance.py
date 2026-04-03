@@ -3,7 +3,7 @@ import os
 import glob
 from collections import Counter
 
-label_dir = '../data/dataset/KITTI/aug_scene/training/aug_label'
+label_dir = '../data/dataset/KITTI/object/training/label_2'
 class_counts = Counter()
 
 for label_file in glob.glob(os.path.join(label_dir, '*.txt')):

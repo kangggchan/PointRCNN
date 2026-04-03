@@ -110,7 +110,7 @@ class GTDatabaseGenerator(KittiDataset):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--save_dir', type=str, default='./gt_database')
-    parser.add_argument('--class_name', type=str, default='Car,Human,ForkLift,CargoBike,ELFplusplus,FTS')
+    parser.add_argument('--class_name', type=str, default='Car,Human,ForkLift,CargoBike')
     parser.add_argument('--split', type=str, default='train')
     parser.add_argument('--root_dir', type=str, default='../data/dataset')
     parser.add_argument('--skip_preprocess', action='store_true', default=False)

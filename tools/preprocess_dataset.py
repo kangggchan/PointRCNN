@@ -2,10 +2,11 @@ import os
 import math
 import shutil
 import argparse
+import numpy as np
 from pathlib import Path
 
 
-TARGET_CLASSES = ('Car', 'Human', 'ForkLift', 'CargoBike', 'ELFplusplus', 'FTS')
+TARGET_CLASSES = ('Car', 'Human', 'ForkLift', 'CargoBike')
 IGNORED_LABELS = {'box', 'boxes', 'Box'}
 
 
@@ -63,6 +64,16 @@ def _lidar_label_to_kitti_line(parts):
 
 
 def _convert_label_file(src_path, dst_path, allowed_classes):
+    """
+    Convert label file format (custom to KITTI).
+    
+    Does NOT filter by point count - use filter_aug_labels_by_points.py for that.
+    
+    Args:
+        src_path: Source label file path
+        dst_path: Destination label file path
+        allowed_classes: Tuple of allowed class names
+    """
     kept_lines = []
 
     with open(src_path, 'r', encoding='utf-8') as f:
@@ -79,15 +90,18 @@ def _convert_label_file(src_path, dst_path, allowed_classes):
             if cls_name not in allowed_classes:
                 continue
 
-            # Already KITTI-like label format
+            kitti_line = None
+
+            # Already KITTI-like label format (15+ fields)
             if len(parts) >= 15:
-                kept_lines.append(' '.join(parts[:16]))
-                continue
+                kitti_line = ' '.join(parts[:16])
 
             # Custom lightweight label format: Class x y z l w h yaw
-            if len(parts) == 8:
-                kept_lines.append(_lidar_label_to_kitti_line(parts))
-                continue
+            elif len(parts) == 8:
+                kitti_line = _lidar_label_to_kitti_line(parts)
+
+            if kitti_line:
+                kept_lines.append(kitti_line)
 
     with open(dst_path, 'w', encoding='utf-8') as f:
         if kept_lines:
@@ -172,7 +186,8 @@ def preprocess_dataset(dataset_root, classes=None, logger=None):
     _write_split(image_sets_root / 'test.txt', val_ids if len(val_ids) > 0 else paired_ids)
 
     if logger:
-        logger.info('Preprocess done: train=%d val=%d total=%d', len(train_ids), len(val_ids), num_total)
+        logger.info('Preprocess done: train=%d val=%d total=%d', 
+                    len(train_ids), len(val_ids), num_total)
 
     return {
         'total': num_total,
@@ -186,7 +201,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Preprocess data/dataset into KITTI-style training layout')
     parser.add_argument('--dataset_root', type=str, default='../data/dataset_2', help='dataset root with bin/ and labels/')
     parser.add_argument('--classes', type=str,
-                        default='Car,Human,ForkLift,CargoBike,ELFplusplus,FTS',
+                        default='Car,Human,ForkLift,CargoBike',
                         help='comma-separated classes to keep')
     args = parser.parse_args()
 
