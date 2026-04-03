@@ -119,3 +119,57 @@ python tools/generate_aug_scene_custom.py
 | `label_2/` `y_cam_bottom` for a Human at z_l=0 | ≈ +h/2 (positive, ground level) |
 | `Tr_velo_to_cam` in every `calib/` file | identity (12 values: `1 0 0 0 0 1 0 0 0 0 1 0`) |
 | Box corners from `generate_corners3d()` | bottom face at stored y, top face at y−h |
+
+
+## 5. Point-in-Box Calculations (Critical!)
+
+When counting LiDAR points inside a 3D bounding box (for quality filtering, analysis, etc.), you **must** respect the **KITTI bottom-center convention**:
+
+### ⚠️ Common Mistake: Treating Y as True Center
+
+**WRONG:**
+```python
+# This FAILS because it assumes y_cam is box true-center
+inside_y = np.abs(local_y) <= height / 2
+```
+
+**Why it fails:** The label stores `y_cam_bottom`, not true center. This check would place the box h/2 too high, missing bottom points.
+
+### ✓ Correct Implementation
+
+**RIGHT:**
+```python
+# Step 1: Translate points by y_bottom
+translated = points - np.array([x_cam, y_cam_bottom, z_cam])
+
+# Step 2: Rotate around Y-axis by ry angle
+cos_ry = np.cos(ry)
+sin_ry = np.sin(ry)
+rot_inv = np.array([
+    [cos_ry, 0, -sin_ry],
+    [0, 1, 0],
+    [sin_ry, 0, cos_ry]
+])
+local = translated @ rot_inv.T
+
+# Step 3: Check containment (KITTI bottom-center)
+inside_x = np.abs(local[:, 0]) <= width / 2      # lateral
+inside_y = (local[:, 1] >= 0) & (local[:, 1] <= height)  # vertical (0 to h)
+inside_z = np.abs(local[:, 2]) <= length / 2     # forward
+
+inside = inside_x & inside_y & inside_z
+count = np.sum(inside)
+```
+
+### What This Does
+
+1. **Translate** by bottom center (y_cam_bottom, not true center)
+2. **Rotate** around **Y-axis** (vertical), not Z
+3. **Check Y bounds** from 0 to h upward, not symmetric around center
+
+### Dimension Ordering
+
+When working with KITTI labels, always remember:
+- Stored order: `h w l` (parts[8], parts[9], parts[10])
+- Spatial mapping: `h`=height(Y), `w`=width(X), `l`=length(Z)
+- Pass to box check as: `(l, w, h)` for `(length, width, height)`

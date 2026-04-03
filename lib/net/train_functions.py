@@ -8,7 +8,12 @@ from collections import namedtuple
 
 def model_joint_fn_decorator():
     ModelReturn = namedtuple("ModelReturn", ['loss', 'tb_dict', 'disp_dict'])
-    MEAN_SIZE = torch.from_numpy(cfg.CLS_MEAN_SIZE[0]).cuda()
+    mean_size_cfg = cfg.CLS_MEAN_SIZE
+    if mean_size_cfg.ndim == 2 and mean_size_cfg.shape[0] > 1:
+        mean_size_cfg = mean_size_cfg.mean(axis=0)
+    else:
+        mean_size_cfg = mean_size_cfg[0]
+    MEAN_SIZE = torch.from_numpy(mean_size_cfg).cuda()
 
     def model_fn(model, data):
         if cfg.RPN.ENABLED:
@@ -42,6 +47,8 @@ def model_joint_fn_decorator():
             rpn_loss = get_rpn_loss(model, rpn_cls, rpn_reg, rpn_cls_label, rpn_reg_label, tb_dict)
             loss += rpn_loss
             disp_dict['rpn_loss'] = rpn_loss.item()
+            disp_dict['rpn_loss_cls'] = tb_dict['rpn_loss_cls']
+            disp_dict['rpn_loss_reg'] = tb_dict['rpn_loss_reg']
 
         if cfg.RCNN.ENABLED:
             rcnn_loss = get_rcnn_loss(model, ret_dict, tb_dict)

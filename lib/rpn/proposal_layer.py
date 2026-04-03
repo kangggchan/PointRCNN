@@ -10,7 +10,12 @@ class ProposalLayer(nn.Module):
     def __init__(self, mode='TRAIN'):
         super().__init__()
         self.mode = mode
-        self.MEAN_SIZE = torch.from_numpy(cfg.CLS_MEAN_SIZE[0]).float()
+        mean_size_cfg = cfg.CLS_MEAN_SIZE
+        if mean_size_cfg.ndim == 2 and mean_size_cfg.shape[0] > 1:
+            mean_size_cfg = mean_size_cfg.mean(axis=0)
+        else:
+            mean_size_cfg = mean_size_cfg[0]
+        self.MEAN_SIZE = torch.from_numpy(mean_size_cfg).float()
 
     def forward(self, rpn_scores, rpn_reg, xyz):
         """

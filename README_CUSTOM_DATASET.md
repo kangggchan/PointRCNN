@@ -61,7 +61,7 @@ Run:
 cd PointRCNN/tools
 python preprocess_dataset.py \
   --dataset_root ../data/dataset \
-  --classes Car,Human,ForkLift,CargoBike,ELFplusplus,FTS
+  --classes Car,Human,ForkLift,CargoBike
 ```
 
 This generates:
@@ -90,10 +90,10 @@ Default config was updated in `tools/cfgs/default.yaml`:
 ### A) Generate GT database
 
 ```bash
-python generate_gt_database_custom.py \
+python generate_gt_database.py \
   --root_dir ../data/dataset \
   --split train \
-  --class_name Car,Human,ForkLift,CargoBike,ELFplusplus,FTS
+  --class_name Car,Human,ForkLift,CargoBike
 ```
 
 This generates:
@@ -101,11 +101,14 @@ This generates:
 
 ### B) Generate augmented scenes
 
+**Note**: With `--weighted_sampling` enabled, the augmentation automatically uses class weights from `tools/cfgs/default.yaml` (`RPN.CLS_WEIGHT`). This ensures augmentation balances classes the same way training does. You can optionally override with `--class_weights "Car:1.1,Human:0.5,..."` if needed.
+
 ```bash
-python generate_aug_scene_custom.py \
-  --root_dir data/dataset \
+python generate_aug_scene.py \
+  --root_dir ../data/dataset \
   --split train \
-  --class_name Car,Human,ForkLift,CargoBike,ELFplusplus,FTS \
+  --class_name Car,Human,ForkLift,CargoBike \
+  --weighted_sampling \
   --gt_database_dir gt_database/train_gt_database_3level_multi.pkl \
   --aug_times 3
 ```
@@ -117,6 +120,33 @@ This generates:
 
 If you train with augmented split, set in `tools/cfgs/default.yaml`:
 - `TRAIN.SPLIT: train_aug`
+
+### C) Optional:
+**Note**: You can use `tools\analyze_aug_scene_points_in_boxes.py` to analyze number of points inside the bounding box per class then use this command to filter the boxes that have less points than a certain number to reduce noise for your imbalance custom dataset
+```bash
+# Basic: Filter Human objects < 100 points (no backup)
+python filter_aug_labels_by_points.py \
+  --aug_label_dir ../data/dataset/KITTI/aug_scene/training/aug_label \
+  --aug_pts_dir ../data/dataset/KITTI/aug_scene/training/rectified_data \
+  --class_name Human \
+  --min_points 100
+
+# With backup: Keep copy of originals before filtering
+python filter_aug_labels_by_points.py \
+  --aug_label_dir ../data/dataset/KITTI/aug_scene/training/aug_label \
+  --aug_pts_dir ../data/dataset/KITTI/aug_scene/training/rectified_data \
+  --class_name Human \
+  --min_points 100 \
+  --backup_dir ../data/dataset/KITTI/aug_scene/training/aug_label_backup
+
+# Multiple classes: Filter multiple classes at once
+python filter_aug_labels_by_points.py \
+  --aug_label_dir ../data/dataset/KITTI/object/training/label_2 \
+  --aug_pts_dir ../data/dataset/KITTI/object/training/velodyne \
+  --class_name Car Human CargoBike ForkLift \
+  --min_points 400 70 60 130 \
+  --backup_dir ../data/dataset/KITTI/aug_scene/training/aug_label_backup
+```
 
 ## 6) Train RPN stage
 
@@ -165,8 +195,8 @@ python generate_aug_scene.py \
   --root_dir ../data/dataset \
   --split train \
   --class_name Car,Human,ForkLift,CargoBike,ELFplusplus,FTS \
-  --gt_database_dir ../gt_database/train_gt_database_3level_multi.pkl \
-  --aug_times 4
+  --gt_database_dir gt_database/train_gt_database_3level_multi.pkl \
+  --aug_times 3
 ```
 
 #### Step 2: Save RPN features and proposals for `train_aug`
@@ -177,7 +207,7 @@ From `tools`:
 cd tools
 python eval_rcnn.py \
   --cfg_file cfgs/default.yaml \
-  --batch_size 4 \
+  --batch_size 8 \
   --eval_mode rpn \
   --ckpt ../output/rpn/default/ckpt/checkpoint_epoch_200.pth \
   --data_root ../data/dataset \
@@ -245,7 +275,11 @@ python train_rcnn.py ... --skip_preprocess
 
 ## 10) Quick sanity check before long training
 
-
+python filter_aug_labels_by_points.py \
+  --aug_label_dir ../data/dataset/KITTI/aug_scene/training/aug_label \
+  --aug_pts_dir ../data/dataset/KITTI/aug_scene/training/rectified_data \
+  --class_name Human \
+  --min_points 100
 
 ```bash
 

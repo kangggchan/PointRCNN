@@ -43,6 +43,7 @@ class KittiRCNNDataset(KittiDataset):
         self.sample_id_list = []
         self.random_select = random_select
         self.logger = logger
+        self.boxes3d_format = 'kitti'
 
         if split == 'train_aug':
             self.aug_label_dir = os.path.join(aug_scene_root_dir, 'training', 'aug_label')

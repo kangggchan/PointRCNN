@@ -7,7 +7,7 @@ cfg = __C
 
 # 0. basic config
 __C.TAG = 'default'
-__C.CLASSES = 'Car,Human,ForkLift,CargoBike,ELFplusplus,FTS'
+__C.CLASSES = 'Car,Human,ForkLift,CargoBike'
 
 __C.INCLUDE_SIMILAR_TYPE = False
 
@@ -29,12 +29,10 @@ __C.PC_AREA_SCOPE = np.array([[-40, 40],
                               [0, 70.4]])  # x, y, z scope in rect camera coords
 
 __C.CLS_MEAN_SIZE = np.array([
-    [1.52, 1.63, 3.88],        # Car
-    [1.7, 0.6, 0.8],           # Human (example, adjust as needed)
-    [2.0, 1.0, 3.0],           # ForkLift (example)
-    [2.2, 0.8, 2.5],           # CargoBike (example)
-    [2.5, 1.2, 3.5],           # ELFplusplus (example)
-    [2.8, 1.5, 4.0],           # FTS (example)
+    [1.676188, 1.679875, 4.199122],  # Car
+    [1.952417, 0.518708, 0.975550],  # Human
+    [2.691739, 1.526909, 4.268391],  # ForkLift
+    [1.312130, 1.097870, 2.833551],  # CargoBike
 ], dtype=np.float32)
 
 
@@ -75,7 +73,7 @@ __C.RPN.LOSS_CLS = 'DiceLoss'
 __C.RPN.FG_WEIGHT = 15
 __C.RPN.FOCAL_ALPHA = [0.25, 0.75]
 __C.RPN.FOCAL_GAMMA = 2.0
-__C.RPN.CLS_WEIGHT = np.array([1.0, 3.18, 0.35, 1.17, 1.53, 1.26, 1.88], dtype=np.float32)  # [bg, Car, Human, ForkLift, CargoBike, ELFplusplus, FTS]
+__C.RPN.CLS_WEIGHT = np.array([1.0, 2.33, 0.37, 3.35, 1.78], dtype=np.float32)  # [bg, Car, Human, ForkLift, CargoBike]
 __C.RPN.REG_LOSS_WEIGHT = [1.0, 1.0, 1.0, 1.0]
 __C.RPN.LOSS_WEIGHT = [1.0, 1.0]
 __C.RPN.NMS_TYPE = 'normal'  # normal, rotate
@@ -132,7 +130,7 @@ __C.RCNN.REG_FC = [256, 256]
 __C.RCNN.LOSS_CLS = 'CrossEntropy'
 __C.RCNN.FOCAL_ALPHA = [0.25, 0.75]
 __C.RCNN.FOCAL_GAMMA = 2.0
-__C.RCNN.CLS_WEIGHT = np.array([1.0, 3.18, 0.35, 1.17, 1.53, 1.26, 1.88], dtype=np.float32)  # [bg, Car, Human, ForkLift, CargoBike, ELFplusplus, FTS]
+__C.RCNN.CLS_WEIGHT = np.array([1.0, 2.33, 0.37, 3.35, 1.78], dtype=np.float32)  # [bg, Car, Human, ForkLift, CargoBike]
 __C.RCNN.CLS_FG_THRESH = 0.5
 __C.RCNN.CLS_BG_THRESH = 0.45
 __C.RCNN.CLS_BG_THRESH_LO = 0.05
@@ -148,10 +146,10 @@ __C.RCNN.NMS_THRESH = 0.1
 
 # general training config
 __C.TRAIN = edict()
-__C.TRAIN.SPLIT = 'train'
+__C.TRAIN.SPLIT = 'train_aug'
 __C.TRAIN.VAL_SPLIT = 'smallval'
 
-__C.TRAIN.LR = 0.002
+__C.TRAIN.LR = 0.001
 __C.TRAIN.LR_CLIP = 0.00001
 __C.TRAIN.LR_DECAY = 0.5
 __C.TRAIN.DECAY_STEP_LIST = [50, 100, 150, 200, 250, 300]
