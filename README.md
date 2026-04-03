@@ -1,8 +1,8 @@
 # Train PointRCNN on a Custom Dataset (like `data/dataset`)
 
-This guide explains how to train this repo on a custom LiDAR dataset in your format.
+This guide explains how to train this repo on a custom LIDAR pointcloud dataset. The dataset used in this project is a combination of [Lidar Warehouse Dataset](https://github.com/anavsgmbh/lidar-warehouse-dataset) and SCALA 2 dataset which we captured by Valeo SCALA 2 Lidar then using an automation labeling pipeline to generate the labels for Car and Human classes. The idea is training a model that have the ability to detect, tracking dynamic objects in a warehouse, then predict its moving direction.
 
-> **⚠️ Important**: This repository has been modified to support custom LiDAR coordinate frames. Custom datasets using Z-axis rotation (yaw) are now properly distinguished from KITTI format which uses Y-axis rotation (ry). See [ROTATION_AXIS_FIX.md](ROTATION_AXIS_FIX.md) for technical details on coordinate frame handling.
+> **⚠️ Important**: This repository has been modified from original PointRCNN to support modern Pytorch and CUDA, custom pointcloud dataset. Custom datasets using Z-axis rotation (yaw) are now properly distinguished from KITTI format which uses Y-axis rotation (ry). See [DATASET_FORMAT.md](DATASET_FORMAT.md) for technical details on coordinate frame handling.
 
 ## 1) Supported custom dataset format
 
@@ -29,8 +29,6 @@ Rules:
   - `Human`
   - `ForkLift`
   - `CargoBike`
-  - `ELFplusplus`
-  - `FTS`
 
 ## 2) Label formats accepted
 
@@ -77,13 +75,45 @@ Notes:
 - Split is auto-created as 80% train / 20% val.
 - `smallval.txt` equals `val.txt`.
 - Dummy calibration files are generated so existing PointRCNN data flow works.
+- 
+### Optional:
+**Note**: You can use `tools\analyze_aug_scene_points_in_boxes.py` to analyze number of points inside the bounding box per class then use this command to filter the boxes that have less points than a certain number to reduce noise for your imbalance custom dataset
+
+#### Basic: Filter Human objects < 100 points (no backup)
+```bas
+python filter_aug_labels_by_points.py \
+  --aug_label_dir ../data/dataset/KITTI/aug_scene/training/aug_label \
+  --aug_pts_dir ../data/dataset/KITTI/aug_scene/training/rectified_data \
+  --class_name Human \
+  --min_points 100
+```
+
+#### With backup: Keep copy of originals before filtering
+```bash
+python filter_aug_labels_by_points.py \
+  --aug_label_dir ../data/dataset/KITTI/aug_scene/training/aug_label \
+  --aug_pts_dir ../data/dataset/KITTI/aug_scene/training/rectified_data \
+  --class_name Human \
+  --min_points 100 \
+  --backup_dir ../data/dataset/KITTI/aug_scene/training/aug_label_backup
+```
+
+#### Multiple classes: Filter multiple classes at once
+```bash
+python filter_aug_labels_by_points.py \
+  --aug_label_dir ../data/dataset/KITTI/object/training/label_2 \
+  --aug_pts_dir ../data/dataset/KITTI/object/training/velodyne \
+  --class_name Car Human CargoBike ForkLift \
+  --min_points 400 70 60 130 \
+  --backup_dir ../data/dataset/KITTI/aug_scene/training/aug_label_backup
+```
 
 ## 4) Config used for custom training
 
 Default config was updated in `tools/cfgs/default.yaml`:
-- `CLASSES: Car,Human,ForkLift,CargoBike,ELFplusplus,FTS`
+- `CLASSES: Car,Human,ForkLift,CargoBike`
 - `INCLUDE_SIMILAR_TYPE: False`
-- `RCNN.CLS_WEIGHT` expanded to 7 entries (background + 6 classes)
+- `RCNN.CLS_WEIGHT` expanded to 5 entries (background + 4 classes)
 
 ## 5) Full pipeline data generation (same flow as original repo)
 
@@ -120,33 +150,6 @@ This generates:
 
 If you train with augmented split, set in `tools/cfgs/default.yaml`:
 - `TRAIN.SPLIT: train_aug`
-
-### C) Optional:
-**Note**: You can use `tools\analyze_aug_scene_points_in_boxes.py` to analyze number of points inside the bounding box per class then use this command to filter the boxes that have less points than a certain number to reduce noise for your imbalance custom dataset
-```bash
-# Basic: Filter Human objects < 100 points (no backup)
-python filter_aug_labels_by_points.py \
-  --aug_label_dir ../data/dataset/KITTI/aug_scene/training/aug_label \
-  --aug_pts_dir ../data/dataset/KITTI/aug_scene/training/rectified_data \
-  --class_name Human \
-  --min_points 100
-
-# With backup: Keep copy of originals before filtering
-python filter_aug_labels_by_points.py \
-  --aug_label_dir ../data/dataset/KITTI/aug_scene/training/aug_label \
-  --aug_pts_dir ../data/dataset/KITTI/aug_scene/training/rectified_data \
-  --class_name Human \
-  --min_points 100 \
-  --backup_dir ../data/dataset/KITTI/aug_scene/training/aug_label_backup
-
-# Multiple classes: Filter multiple classes at once
-python filter_aug_labels_by_points.py \
-  --aug_label_dir ../data/dataset/KITTI/object/training/label_2 \
-  --aug_pts_dir ../data/dataset/KITTI/object/training/velodyne \
-  --class_name Car Human CargoBike ForkLift \
-  --min_points 400 70 60 130 \
-  --backup_dir ../data/dataset/KITTI/aug_scene/training/aug_label_backup
-```
 
 ## 6) Train RPN stage
 
@@ -273,24 +276,25 @@ python train_rcnn.py ... --skip_preprocess
 - Keep class names exactly consistent between labels and config.
 - Make sure all `.bin` are `float32` with shape `N x 4` (`x y z intensity`).
 
-## 10) Quick sanity check before long training
-
-python filter_aug_labels_by_points.py \
-  --aug_label_dir ../data/dataset/KITTI/aug_scene/training/aug_label \
-  --aug_pts_dir ../data/dataset/KITTI/aug_scene/training/rectified_data \
-  --class_name Human \
-  --min_points 100
-
+## 10) Utilities
+###To check class balance inside KITTI folder before generate DB
 ```bash
+python tools/check_class_balance.py
+```
 
+###To compute mean of bounding box by class
+```bash
+python tools/compute_cls_mean_size.py
+```
+
+###To visualize augemented scenes in Open3D (replaace 000000 with the ID of the frame):
+```bash
+python tools/verify_bin_conversion.py --idx 000000
+```
+
+###To enable Open3D GUI in WSL:
+```bash
 unset WAYLAND_DISPLAY
 export XDG_SESSION_TYPE=x11
 LIBGL_ALWAYS_SOFTWARE=1 MESA_LOADER_DRIVER_OVERRIDE=llvmpipe GALLIUM_DRIVER=llvmpipe 
-
-/home/lenovo/venvs/pointrcnn/bin/python tools/preprocess_dataset.py --dataset_root data/dataset
-head -n 5 data/dataset/KITTI/ImageSets/train.txt
-ls data/dataset/KITTI/object/training/velodyne | head
-ls data/dataset/KITTI/object/training/label_2 | head
 ```
-
-If these files exist and IDs match, you are ready to train.
