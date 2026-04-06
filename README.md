@@ -221,7 +221,7 @@ python eval_rcnn.py \
 If you also want offline evaluation features for validation, run:
 
 ```bash
-/home/lenovo/venvs/pointrcnn/bin/python eval_rcnn.py \
+python eval_rcnn.py \
   --cfg_file cfgs/default.yaml \
   --batch_size 4 \
   --eval_mode rpn \

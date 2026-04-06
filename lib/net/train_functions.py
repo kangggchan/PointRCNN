@@ -2,18 +2,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lib.utils.loss_utils as loss_utils
+import lib.utils.kitti_utils as kitti_utils
 from lib.config import cfg
 from collections import namedtuple
 
 
 def model_joint_fn_decorator():
     ModelReturn = namedtuple("ModelReturn", ['loss', 'tb_dict', 'disp_dict'])
-    mean_size_cfg = cfg.CLS_MEAN_SIZE
-    if mean_size_cfg.ndim == 2 and mean_size_cfg.shape[0] > 1:
-        mean_size_cfg = mean_size_cfg.mean(axis=0)
-    else:
-        mean_size_cfg = mean_size_cfg[0]
-    MEAN_SIZE = torch.from_numpy(mean_size_cfg).cuda()
+    MEAN_SIZE = torch.from_numpy(kitti_utils.get_default_mean_size()).cuda()
 
     def model_fn(model, data):
         if cfg.RPN.ENABLED:
@@ -102,16 +98,23 @@ def model_joint_fn_decorator():
         point_num = rpn_reg.size(0) * rpn_reg.size(1)
         fg_sum = fg_mask.long().sum().item()
         if fg_sum != 0:
+            size_template_ids = kitti_utils.get_size_template_ids_torch(
+                rpn_reg_label.view(point_num, 7)[fg_mask][:, 3:6],
+                device=rpn_reg.device,
+            )
+            anchor_size = kitti_utils.get_anchor_sizes_by_template_ids_torch(size_template_ids,
+                                                                             device=rpn_reg.device)
             loss_loc, loss_angle, loss_size, reg_loss_dict = \
                 loss_utils.get_reg_loss(rpn_reg.view(point_num, -1)[fg_mask],
                                         rpn_reg_label.view(point_num, 7)[fg_mask],
                                         loc_scope=cfg.RPN.LOC_SCOPE,
                                         loc_bin_size=cfg.RPN.LOC_BIN_SIZE,
                                         num_head_bin=cfg.RPN.NUM_HEAD_BIN,
-                                        anchor_size=MEAN_SIZE,
+                                        anchor_size=anchor_size,
                                         get_xz_fine=cfg.RPN.LOC_XZ_FINE,
                                         get_y_by_bin=False,
-                                        get_ry_fine=False)
+                                        get_ry_fine=False,
+                                        size_template_ids=size_template_ids)
 
             loss_size = 3 * loss_size  # consistent with old codes
             rpn_loss_reg = loss_loc + loss_angle + loss_size
@@ -203,8 +206,11 @@ def model_joint_fn_decorator():
         fg_mask = (reg_valid_mask > 0)
         fg_sum = fg_mask.long().sum().item()
         if fg_sum != 0:
-            all_anchor_size = roi_size
-            anchor_size = all_anchor_size[fg_mask] if cfg.RCNN.SIZE_RES_ON_ROI else MEAN_SIZE
+            if cfg.RCNN.SIZE_RES_ON_ROI:
+                all_anchor_size = roi_size
+                anchor_size = all_anchor_size[fg_mask]
+            else:
+                anchor_size = kitti_utils.get_class_anchor_sizes_torch(cls_label_flat[fg_mask], device=rcnn_reg.device)
 
             loss_loc, loss_angle, loss_size, reg_loss_dict = \
                 loss_utils.get_reg_loss(rcnn_reg.view(batch_size, -1)[fg_mask],

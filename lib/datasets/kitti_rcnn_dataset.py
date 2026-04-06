@@ -38,6 +38,8 @@ class KittiRCNNDataset(KittiDataset):
             aug_scene_root_dir = os.path.join(root_dir, 'KITTI', 'aug_scene')
 
         self.num_class = self.classes.__len__()
+        self.class_to_idx = {class_name: idx for idx, class_name in enumerate(self.classes)}
+        self.similar_class_map = {'Van': 'Car', 'Person_sitting': 'Pedestrian'}
 
         self.npoints = npoints
         self.sample_id_list = []
@@ -52,12 +54,7 @@ class KittiRCNNDataset(KittiDataset):
             self.aug_label_dir = os.path.join(aug_scene_root_dir, 'training', 'aug_label')
             self.aug_pts_dir = os.path.join(aug_scene_root_dir, 'training', 'rectified_data')
 
-        # for rcnn training
-        self.rcnn_training_bbox_list = []
         self.rpn_feature_list = {}
-        self.pos_bbox_list = []
-        self.neg_bbox_list = []
-        self.far_neg_bbox_list = []
         self.rcnn_eval_roi_dir = rcnn_eval_roi_dir
         self.rcnn_eval_feature_dir = rcnn_eval_feature_dir
         self.rcnn_training_roi_dir = rcnn_training_roi_dir
@@ -176,6 +173,23 @@ class KittiRCNNDataset(KittiDataset):
             rpn_seg_file = os.path.join(rpn_feature_dir, '%06d_seg.npy' % idx)
             rpn_seg_score = np.load(rpn_seg_file).reshape(-1)
         return np.load(rpn_xyz_file), np.load(rpn_feature_file), np.load(rpn_intensity_file).reshape(-1), rpn_seg_score
+
+    def get_class_idx(self, cls_type):
+        mapped_type = self.similar_class_map.get(cls_type, cls_type)
+        return self.class_to_idx.get(mapped_type, -1)
+
+    def objs_to_gt_boxes3d(self, obj_list, with_classes=False):
+        box_dim = 8 if with_classes else 7
+        boxes3d = np.zeros((len(obj_list), box_dim), dtype=np.float32)
+        for idx, obj in enumerate(obj_list):
+            boxes3d[idx, 0:3] = obj.pos
+            boxes3d[idx, 3] = obj.h
+            boxes3d[idx, 4] = obj.w
+            boxes3d[idx, 5] = obj.l
+            boxes3d[idx, 6] = obj.ry
+            if with_classes:
+                boxes3d[idx, 7] = self.get_class_idx(obj.cls_type)
+        return boxes3d
 
     def filtrate_objects(self, obj_list):
         """
@@ -385,7 +399,8 @@ class KittiRCNNDataset(KittiDataset):
         gt_obj_list = self.filtrate_objects(self.get_label(sample_id))
         if cfg.GT_AUG_ENABLED and self.mode == 'TRAIN' and gt_aug_flag:
             gt_obj_list.extend(extra_gt_obj_list)
-        gt_boxes3d = kitti_utils.objs_to_boxes3d(gt_obj_list)
+        gt_boxes3d = self.objs_to_gt_boxes3d(gt_obj_list)
+        gt_boxes3d_with_cls = self.objs_to_gt_boxes3d(gt_obj_list, with_classes=True)
         # Use pre-detected format (detected once during init, not per-batch)
 
         gt_alpha = np.zeros((gt_obj_list.__len__()), dtype=np.float32)
@@ -400,6 +415,11 @@ class KittiRCNNDataset(KittiDataset):
                                                                               sample_id)
             sample_info['aug_method'] = aug_method
 
+        if cfg.RCNN.ENABLED:
+            aug_gt_boxes3d_with_cls = np.concatenate((aug_gt_boxes3d, gt_boxes3d_with_cls[:, 7:8].copy()), axis=1)
+        else:
+            aug_gt_boxes3d_with_cls = aug_gt_boxes3d
+
         # prepare input
         if cfg.RPN.USE_INTENSITY:
             pts_input = np.concatenate((aug_pts_rect, ret_pts_features), axis=1)  # (N, C)
@@ -410,7 +430,7 @@ class KittiRCNNDataset(KittiDataset):
             sample_info['pts_input'] = pts_input
             sample_info['pts_rect'] = aug_pts_rect
             sample_info['pts_features'] = ret_pts_features
-            sample_info['gt_boxes3d'] = aug_gt_boxes3d
+            sample_info['gt_boxes3d'] = aug_gt_boxes3d_with_cls
             return sample_info
 
         # generate training labels (using pre-detected format)
@@ -420,7 +440,7 @@ class KittiRCNNDataset(KittiDataset):
         sample_info['pts_features'] = ret_pts_features
         sample_info['rpn_cls_label'] = rpn_cls_label
         sample_info['rpn_reg_label'] = rpn_reg_label
-        sample_info['gt_boxes3d'] = aug_gt_boxes3d
+        sample_info['gt_boxes3d'] = aug_gt_boxes3d_with_cls
         return sample_info
 
     @staticmethod
@@ -631,118 +651,6 @@ class KittiRCNNDataset(KittiDataset):
 
         return aug_pts_rect, aug_gt_boxes3d, aug_method
 
-    def get_rcnn_sample_info(self, roi_info):
-        sample_id, gt_box3d = roi_info['sample_id'], roi_info['gt_box3d']
-        rpn_xyz, rpn_features, rpn_intensity, seg_mask = self.rpn_feature_list[sample_id]
-
-        # augmentation original roi by adding noise
-        roi_box3d = self.aug_roi_by_noise(roi_info)
-
-        # point cloud pooling based on roi_box3d
-        pooled_boxes3d = kitti_utils.enlarge_box3d(roi_box3d.reshape(1, 7), cfg.RCNN.POOL_EXTRA_WIDTH)
-
-        boxes_pts_mask_list = roipool3d_utils.pts_in_boxes3d_cpu(torch.from_numpy(rpn_xyz),
-                                                                 torch.from_numpy(pooled_boxes3d))
-        pt_mask_flag = (boxes_pts_mask_list[0].numpy() == 1)
-        cur_pts = rpn_xyz[pt_mask_flag].astype(np.float32)
-
-        # data augmentation
-        aug_pts = cur_pts.copy()
-        aug_gt_box3d = gt_box3d.copy().astype(np.float32)
-        aug_roi_box3d = roi_box3d.copy()
-        if cfg.AUG_DATA and self.mode == 'TRAIN':
-            # calculate alpha by ry
-            temp_boxes3d = np.concatenate([aug_roi_box3d.reshape(1, 7), aug_gt_box3d.reshape(1, 7)], axis=0)
-            temp_x, temp_z, temp_ry = temp_boxes3d[:, 0], temp_boxes3d[:, 2], temp_boxes3d[:, 6]
-            temp_beta = np.arctan2(temp_z, temp_x).astype(np.float64)
-            temp_alpha = -np.sign(temp_beta) * np.pi / 2 + temp_beta + temp_ry
-
-            # data augmentation
-            aug_pts, aug_boxes3d, aug_method = self.data_augmentation(aug_pts, temp_boxes3d, temp_alpha, mustaug=True, stage=2)
-            aug_roi_box3d, aug_gt_box3d = aug_boxes3d[0], aug_boxes3d[1]
-            aug_gt_box3d = aug_gt_box3d.astype(gt_box3d.dtype)
-
-        # Pool input points
-        valid_mask = 1  # whether the input is valid
-
-        if aug_pts.shape[0] == 0:
-            pts_features = np.zeros((1, 128), dtype=np.float32)
-            input_channel = 3 + int(cfg.RCNN.USE_INTENSITY) + int(cfg.RCNN.USE_MASK) + int(cfg.RCNN.USE_DEPTH)
-            pts_input = np.zeros((1, input_channel), dtype=np.float32)
-            valid_mask = 0
-        else:
-            pts_features = rpn_features[pt_mask_flag].astype(np.float32)
-            pts_intensity = rpn_intensity[pt_mask_flag].astype(np.float32)
-
-            pts_input_list = [aug_pts, pts_intensity.reshape(-1, 1)]
-            if cfg.RCNN.USE_INTENSITY:
-                pts_input_list = [aug_pts, pts_intensity.reshape(-1, 1)]
-            else:
-                pts_input_list = [aug_pts]
-
-            if cfg.RCNN.USE_MASK:
-                if cfg.RCNN.MASK_TYPE == 'seg':
-                    pts_mask = seg_mask[pt_mask_flag].astype(np.float32)
-                elif cfg.RCNN.MASK_TYPE == 'roi':
-                    pts_mask = roipool3d_utils.pts_in_boxes3d_cpu(torch.from_numpy(aug_pts),
-                                                                  torch.from_numpy(aug_roi_box3d.reshape(1, 7)))
-                    pts_mask = (pts_mask[0].numpy() == 1).astype(np.float32)
-                else:
-                    raise NotImplementedError
-
-                pts_input_list.append(pts_mask.reshape(-1, 1))
-
-            if cfg.RCNN.USE_DEPTH:
-                pts_depth = np.linalg.norm(aug_pts, axis=1, ord=2)
-                pts_depth_norm = (pts_depth / 70.0) - 0.5
-                pts_input_list.append(pts_depth_norm.reshape(-1, 1))
-
-            pts_input = np.concatenate(pts_input_list, axis=1)  # (N, C)
-
-        aug_gt_corners = kitti_utils.boxes3d_to_corners3d(aug_gt_box3d.reshape(-1, 7))
-        aug_roi_corners = kitti_utils.boxes3d_to_corners3d(aug_roi_box3d.reshape(-1, 7))
-        iou3d = kitti_utils.get_iou3d(aug_roi_corners, aug_gt_corners)
-        cur_iou = iou3d[0][0]
-
-        # regression valid mask
-        reg_valid_mask = 1 if cur_iou >= cfg.RCNN.REG_FG_THRESH and valid_mask == 1 else 0
-
-        # classification label
-        cls_label = 1 if cur_iou > cfg.RCNN.CLS_FG_THRESH else 0
-        if cfg.RCNN.CLS_BG_THRESH < cur_iou < cfg.RCNN.CLS_FG_THRESH or valid_mask == 0:
-            cls_label = -1
-
-        # canonical transform and sampling
-        pts_input_ct, gt_box3d_ct = self.canonical_transform(pts_input, aug_roi_box3d, aug_gt_box3d)
-        pts_input_ct, pts_features = self.rcnn_input_sample(pts_input_ct, pts_features)
-
-        sample_info = {'sample_id': sample_id,
-                       'pts_input': pts_input_ct,
-                       'pts_features': pts_features,
-                       'cls_label': cls_label,
-                       'reg_valid_mask': reg_valid_mask,
-                       'gt_boxes3d_ct': gt_box3d_ct,
-                       'roi_boxes3d': aug_roi_box3d,
-                       'roi_size': aug_roi_box3d[3:6],
-                       'gt_boxes3d': aug_gt_box3d}
-
-        return sample_info
-
-    @staticmethod
-    def canonical_transform(pts_input, roi_box3d, gt_box3d):
-        roi_ry = roi_box3d[6] % (2 * np.pi)  # 0 ~ 2pi
-        roi_center = roi_box3d[0:3]
-        # shift to center
-        pts_input[:, [0, 1, 2]] = pts_input[:, [0, 1, 2]] - roi_center
-        gt_box3d_ct = np.copy(gt_box3d)
-        gt_box3d_ct[0:3] = gt_box3d_ct[0:3] - roi_center
-        # rotate to the direction of head
-        gt_box3d_ct = kitti_utils.rotate_pc_along_y(gt_box3d_ct.reshape(1, 7), roi_ry).reshape(7)
-        gt_box3d_ct[6] = gt_box3d_ct[6] - roi_ry
-        pts_input = kitti_utils.rotate_pc_along_y(pts_input, roi_ry)
-
-        return pts_input, gt_box3d_ct
-
     @staticmethod
     def canonical_transform_batch(pts_input, roi_boxes3d, gt_boxes3d):
         """
@@ -764,46 +672,6 @@ class KittiRCNNDataset(KittiDataset):
         pts_input = kitti_utils.rotate_pc_along_y_torch(torch.from_numpy(pts_input), torch.from_numpy(roi_ry)).numpy()
 
         return pts_input, gt_boxes3d_ct
-
-    @staticmethod
-    def rcnn_input_sample(pts_input, pts_features):
-        choice = np.random.choice(pts_input.shape[0], cfg.RCNN.NUM_POINTS, replace=True)
-
-        if pts_input.shape[0] < cfg.RCNN.NUM_POINTS:
-            choice[:pts_input.shape[0]] = np.arange(pts_input.shape[0])
-            np.random.shuffle(choice)
-        pts_input = pts_input[choice]
-        pts_features = pts_features[choice]
-
-        return pts_input, pts_features
-
-    def aug_roi_by_noise(self, roi_info):
-        """
-        add noise to original roi to get aug_box3d
-        :param roi_info:
-        :return:
-        """
-        roi_box3d, gt_box3d = roi_info['roi_box3d'], roi_info['gt_box3d']
-        original_iou = roi_info['iou3d']
-        temp_iou = cnt = 0
-        pos_thresh = min(cfg.RCNN.REG_FG_THRESH, cfg.RCNN.CLS_FG_THRESH)
-        gt_corners = kitti_utils.boxes3d_to_corners3d(gt_box3d.reshape(-1, 7))
-        aug_box3d = roi_box3d
-        while temp_iou < pos_thresh and cnt < 10:
-            if roi_info['type'] == 'gt':
-                aug_box3d = self.random_aug_box3d(roi_box3d)  # GT, must random
-            else:
-                if np.random.rand() < 0.2:
-                    aug_box3d = roi_box3d  # p=0.2 to keep the original roi box
-                else:
-                    aug_box3d = self.random_aug_box3d(roi_box3d)
-            aug_corners = kitti_utils.boxes3d_to_corners3d(aug_box3d.reshape(-1, 7))
-            iou3d = kitti_utils.get_iou3d(aug_corners, gt_corners)
-            temp_iou = iou3d[0][0]
-            cnt += 1
-            if original_iou < pos_thresh:  # original bg, break
-                break
-        return aug_box3d
 
     @staticmethod
     def random_aug_box3d(box3d):
@@ -877,10 +745,10 @@ class KittiRCNNDataset(KittiDataset):
 
             if self.mode != 'TEST':
                 gt_obj_list = self.filtrate_objects(self.get_label(sample_id))
-                gt_boxes3d = kitti_utils.objs_to_boxes3d(gt_obj_list)
+                gt_boxes3d = self.objs_to_gt_boxes3d(gt_obj_list, with_classes=True)
 
                 roi_corners = kitti_utils.boxes3d_to_corners3d(roi_boxes3d)
-                gt_corners = kitti_utils.boxes3d_to_corners3d(gt_boxes3d)
+                gt_corners = kitti_utils.boxes3d_to_corners3d(gt_boxes3d[:, 0:7])
                 iou3d = kitti_utils.get_iou3d(roi_corners, gt_corners)
                 if gt_boxes3d.shape[0] > 0:
                     gt_iou = iou3d.max(axis=1)
@@ -917,17 +785,13 @@ class KittiRCNNDataset(KittiDataset):
             return sample_dict
 
         gt_obj_list = self.filtrate_objects(self.get_label(sample_id))
-        gt_boxes3d = np.zeros((gt_obj_list.__len__(), 7), dtype=np.float32)
-
-        for k, obj in enumerate(gt_obj_list):
-            gt_boxes3d[k, 0:3], gt_boxes3d[k, 3], gt_boxes3d[k, 4], gt_boxes3d[k, 5], gt_boxes3d[k, 6] \
-                = obj.pos, obj.h, obj.w, obj.l, obj.ry
+        gt_boxes3d = self.objs_to_gt_boxes3d(gt_obj_list, with_classes=True)
 
         if gt_boxes3d.__len__() == 0:
             gt_iou = np.zeros((roi_boxes3d.shape[0]), dtype=np.float32)
         else:
             roi_corners = kitti_utils.boxes3d_to_corners3d(roi_boxes3d)
-            gt_corners = kitti_utils.boxes3d_to_corners3d(gt_boxes3d)
+            gt_corners = kitti_utils.boxes3d_to_corners3d(gt_boxes3d[:, 0:7])
             iou3d = kitti_utils.get_iou3d(roi_corners, gt_corners)
             gt_iou = iou3d.max(axis=1)
         sample_dict['gt_boxes3d'] = gt_boxes3d
@@ -947,11 +811,11 @@ class KittiRCNNDataset(KittiDataset):
         # roi_scores = kitti_utils.objs_to_scores(roi_obj_list)
 
         gt_obj_list = self.filtrate_objects(self.get_label(sample_id))
-        gt_boxes3d = kitti_utils.objs_to_boxes3d(gt_obj_list)
+        gt_boxes3d = self.objs_to_gt_boxes3d(gt_obj_list, with_classes=True)
 
         # calculate original iou
         iou3d = kitti_utils.get_iou3d(kitti_utils.boxes3d_to_corners3d(roi_boxes3d),
-                                      kitti_utils.boxes3d_to_corners3d(gt_boxes3d))
+                          kitti_utils.boxes3d_to_corners3d(gt_boxes3d[:, 0:7]))
         max_overlaps, gt_assignment = iou3d.max(axis=1), iou3d.argmax(axis=1)
         max_iou_of_gt, roi_assignment = iou3d.max(axis=0), iou3d.argmax(axis=0)
         roi_assignment = roi_assignment[max_iou_of_gt > 0].reshape(-1)
@@ -982,7 +846,7 @@ class KittiRCNNDataset(KittiDataset):
         elif fg_num_rois > 0 and bg_num_rois == 0:
             # sampling fg
             rand_num = np.floor(np.random.rand(cfg.RCNN.ROI_PER_IMAGE ) * fg_num_rois)
-            rand_num = torch.from_numpy(rand_num).type_as(gt_boxes3d).long()
+            rand_num = rand_num.astype(np.int32)
             fg_inds = fg_inds[rand_num]
             fg_rois_per_this_image = cfg.RCNN.ROI_PER_IMAGE
             bg_rois_per_this_image = 0
@@ -992,9 +856,7 @@ class KittiRCNNDataset(KittiDataset):
             bg_inds = self.sample_bg_inds(hard_bg_inds, easy_bg_inds, bg_rois_per_this_image)
             fg_rois_per_this_image = 0
         else:
-            import pdb
-            pdb.set_trace()
-            raise NotImplementedError
+            raise NotImplementedError('No foreground or background ROIs available for RCNN batch sampling')
 
         # augment the rois by noise
         roi_list, roi_iou_list, roi_gt_list = [], [], []
@@ -1039,7 +901,7 @@ class KittiRCNNDataset(KittiDataset):
         if cfg.AUG_DATA and self.mode == 'TRAIN':
             for k in range(rois.__len__()):
                 aug_pts = pts_input[k, :, 0:3].copy()
-                aug_gt_box3d = gt_of_rois[k].copy()
+                aug_gt_box3d = gt_of_rois[k, 0:7].copy()
                 aug_roi_box3d = rois[k].copy()
 
                 # calculate alpha by ry
@@ -1055,7 +917,7 @@ class KittiRCNNDataset(KittiDataset):
                 # assign to original data
                 pts_input[k, :, 0:3] = aug_pts
                 rois[k] = aug_boxes3d[0]
-                gt_of_rois[k] = aug_boxes3d[1]
+                gt_of_rois[k, 0:7] = aug_boxes3d[1]
 
         valid_mask = (pts_empty_flag == 0).astype(np.int32)
 
@@ -1063,21 +925,15 @@ class KittiRCNNDataset(KittiDataset):
         reg_valid_mask = (iou_of_rois > cfg.RCNN.REG_FG_THRESH).astype(np.int32) & valid_mask
 
         # classification label
-        cls_label = np.zeros(rois.shape[0], dtype=np.int32) - 1  # -1 for invalid
-        for i, gt_idx in enumerate(gt_assignment):
-            if max_overlaps[i] > cfg.RCNN.CLS_FG_THRESH:
-                cls_obj = gt_obj_list[gt_idx]
-                cls_label[i] = self.classes.index(cls_obj.cls_type)  # 0-6 based on class
-            elif max_overlaps[i] > cfg.RCNN.CLS_BG_THRESH:
-                cls_label[i] = -1  # Unknown/don't care
-            else:
-                cls_label[i] = 0  # Background
+        cls_label = np.zeros(rois.shape[0], dtype=np.int32)
+        fg_mask = iou_of_rois > cfg.RCNN.CLS_FG_THRESH
+        cls_label[fg_mask] = gt_of_rois[fg_mask, 7].astype(np.int32)
         invalid_mask = (iou_of_rois > cfg.RCNN.CLS_BG_THRESH) & (iou_of_rois < cfg.RCNN.CLS_FG_THRESH)
         cls_label[invalid_mask] = -1
         cls_label[valid_mask == 0] = -1
 
         # canonical transform and sampling
-        pts_input_ct, gt_boxes3d_ct = self.canonical_transform_batch(pts_input, rois, gt_of_rois)
+        pts_input_ct, gt_boxes3d_ct = self.canonical_transform_batch(pts_input, rois, gt_of_rois[:, 0:7])
 
         sample_info = {'sample_id': sample_id,
                        'pts_input': pts_input_ct,
@@ -1087,7 +943,7 @@ class KittiRCNNDataset(KittiDataset):
                        'gt_boxes3d_ct': gt_boxes3d_ct,
                        'roi_boxes3d': rois,
                        'roi_size': rois[:, 3:6],
-                       'gt_boxes3d': gt_of_rois}
+                       'gt_boxes3d': gt_of_rois[:, 0:7]}
 
         return sample_info
 
@@ -1129,7 +985,7 @@ class KittiRCNNDataset(KittiDataset):
         for k in range(roi_boxes3d.__len__()):
             temp_iou = cnt = 0
             roi_box3d = roi_boxes3d[k]
-            gt_box3d = gt_boxes3d[k]
+            gt_box3d = gt_boxes3d[k, 0:7]
             pos_thresh = min(cfg.RCNN.REG_FG_THRESH, cfg.RCNN.CLS_FG_THRESH)
             gt_corners = kitti_utils.boxes3d_to_corners3d(gt_box3d.reshape(1, 7))
             aug_box3d = roi_box3d
@@ -1158,7 +1014,7 @@ class KittiRCNNDataset(KittiDataset):
         # roi_scores = kitti_utils.objs_to_scores(roi_obj_list)
 
         gt_obj_list = self.filtrate_objects(self.get_label(sample_id))
-        gt_boxes3d = kitti_utils.objs_to_boxes3d(gt_obj_list)
+        gt_boxes3d = self.objs_to_gt_boxes3d(gt_obj_list, with_classes=True)
 
         sample_info = {'sample_id': sample_id,
                        'rpn_xyz': rpn_xyz,
@@ -1185,7 +1041,8 @@ class KittiRCNNDataset(KittiDataset):
                 max_gt = 0
                 for k in range(batch_size):
                     max_gt = max(max_gt, batch[k][key].__len__())
-                batch_gt_boxes3d = np.zeros((batch_size, max_gt, 7), dtype=np.float32)
+                box_dim = max(batch[k][key].shape[1] if batch[k][key].ndim == 2 else 0 for k in range(batch_size))
+                batch_gt_boxes3d = np.zeros((batch_size, max_gt, box_dim), dtype=np.float32)
                 for i in range(batch_size):
                     batch_gt_boxes3d[i, :batch[i][key].__len__(), :] = batch[i][key]
                 ans_dict[key] = batch_gt_boxes3d

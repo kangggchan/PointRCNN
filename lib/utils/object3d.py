@@ -1,11 +1,16 @@
 import numpy as np
 
+from lib.config import cfg
+
 
 def cls_type_to_id(cls_type):
-    type_to_id = {'Car': 1, 'Pedestrian': 2, 'Cyclist': 3, 'Van': 4}
-    if cls_type not in type_to_id.keys():
-        return -1
-    return type_to_id[cls_type]
+    class_names = [name.strip() for name in str(cfg.CLASSES).split(',') if name.strip()]
+    type_to_id = {name: idx + 1 for idx, name in enumerate(class_names)}
+    if 'Car' in type_to_id:
+        type_to_id.setdefault('Van', type_to_id['Car'])
+    if 'Pedestrian' in type_to_id:
+        type_to_id.setdefault('Person_sitting', type_to_id['Pedestrian'])
+    return type_to_id.get(cls_type, -1)
 
 
 class Object3d(object):

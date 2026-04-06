@@ -30,10 +30,11 @@ class RPN(nn.Module):
         # regression branch
         per_loc_bin_num = int(cfg.RPN.LOC_SCOPE / cfg.RPN.LOC_BIN_SIZE) * 2
         if cfg.RPN.LOC_XZ_FINE:
-            reg_channel = per_loc_bin_num * 4 + cfg.RPN.NUM_HEAD_BIN * 2 + 3
+            reg_channel = per_loc_bin_num * 4 + cfg.RPN.NUM_HEAD_BIN * 2
         else:
-            reg_channel = per_loc_bin_num * 2 + cfg.RPN.NUM_HEAD_BIN * 2 + 3
+            reg_channel = per_loc_bin_num * 2 + cfg.RPN.NUM_HEAD_BIN * 2
         reg_channel += 1  # reg y
+        reg_channel += int(np.asarray(cfg.CLS_MEAN_SIZE).reshape(-1, 3).shape[0]) * 3  # size residuals per template
 
         reg_layers = []
         pre_channel = cfg.RPN.FP_MLPS[0][-1]

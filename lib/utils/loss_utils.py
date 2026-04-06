@@ -85,7 +85,8 @@ def _sigmoid_cross_entropy_with_logits(logits, labels):
 
 
 def get_reg_loss(pred_reg, reg_label, loc_scope, loc_bin_size, num_head_bin, anchor_size,
-                 get_xz_fine=True, get_y_by_bin=False, loc_y_scope=0.5, loc_y_bin_size=0.25, get_ry_fine=False):
+                 get_xz_fine=True, get_y_by_bin=False, loc_y_scope=0.5, loc_y_bin_size=0.25,
+                 get_ry_fine=False, size_template_ids=None):
 
     """
     Bin-based 3D bounding boxes regression loss. See https://arxiv.org/abs/1812.04244 for more details.
@@ -218,11 +219,21 @@ def get_reg_loss(pred_reg, reg_label, loc_scope, loc_bin_size, num_head_bin, anc
     angle_loss = loss_ry_bin + loss_ry_res
 
     # size loss
-    size_res_l, size_res_r = ry_res_r, ry_res_r + 3
-    assert pred_reg.shape[1] == size_res_r, '%d vs %d' % (pred_reg.shape[1], size_res_r)
+    size_res_l = ry_res_r
+    size_channel_num = pred_reg.shape[1] - size_res_l
+    assert size_channel_num > 0 and size_channel_num % 3 == 0, '%d vs %d' % (pred_reg.shape[1], size_res_l)
 
     size_res_norm_label = (reg_label[:, 3:6] - anchor_size) / anchor_size
-    size_res_norm = pred_reg[:, size_res_l:size_res_r]
+    num_size_templates = size_channel_num // 3
+    if num_size_templates == 1:
+        size_res_norm = pred_reg[:, size_res_l:size_res_l + 3]
+    else:
+        if size_template_ids is None:
+            raise ValueError('size_template_ids is required when pred_reg contains multiple size templates')
+        size_template_ids = size_template_ids.long().view(-1, 1, 1)
+        size_res_all = pred_reg[:, size_res_l:].view(-1, num_size_templates, 3)
+        size_res_norm = torch.gather(size_res_all, dim=1,
+                                     index=size_template_ids.expand(-1, 1, 3)).squeeze(1)
     size_loss = F.smooth_l1_loss(size_res_norm, size_res_norm_label)
 
     # Total regression loss

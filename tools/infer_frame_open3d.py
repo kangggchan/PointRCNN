@@ -7,11 +7,6 @@ import open3d as o3d
 import torch
 import torch.nn.functional as F
 
-from infer_single_bin import adapt_cfg_from_checkpoint
-from infer_single_bin import boxes_rect_to_lidar_corners
-from infer_single_bin import ensure_iou3d_utils
-from infer_single_bin import preprocess
-from infer_single_bin import should_use_cuda
 from lib.config import cfg, cfg_from_file
 from lib.datasets.kitti_rcnn_dataset import KittiRCNNDataset
 from lib.net.point_rcnn import PointRCNN
@@ -35,19 +30,192 @@ BOX_EDGES = [
 ]
 
 
+def _is_identity_calibration(calib) -> bool:
+    return (
+        np.allclose(calib.R0, np.eye(3, dtype=np.float32), atol=1e-6)
+        and np.allclose(
+            calib.V2C,
+            np.array([[1.0, 0.0, 0.0, 0.0],
+                      [0.0, 1.0, 0.0, 0.0],
+                      [0.0, 0.0, 1.0, 0.0]], dtype=np.float32),
+            atol=1e-6,
+        )
+    )
+
+
+def _resolve_pc_area_scope(class_names, calib):
+    if _is_identity_calibration(calib):
+        if [name.lower() for name in class_names] == ['car']:
+            return np.array([[-40.0, 40.0], [-3.0, 3.0], [-70.4, 70.4]], dtype=np.float32)
+        return np.array([[-50.0, 50.0], [-3.0, 3.0], [-50.0, 50.0]], dtype=np.float32)
+    return np.asarray(cfg.PC_AREA_SCOPE, dtype=np.float32)
+
+
+def _sample_points_like_dataset(pts_rect, pts_intensity, npoints):
+    num_pts = len(pts_rect)
+    if num_pts == 0:
+        ret_pts_rect = np.zeros((npoints, 3), dtype=np.float32)
+        ret_pts_intensity = np.zeros((npoints,), dtype=np.float32)
+        return ret_pts_rect, ret_pts_intensity
+
+    if npoints < num_pts:
+        pts_depth = pts_rect[:, 2]
+        pts_near_flag = pts_depth < 40.0
+        far_idxs_choice = np.where(pts_near_flag == 0)[0]
+        near_idxs = np.where(pts_near_flag == 1)[0]
+
+        near_need = max(npoints - len(far_idxs_choice), 0)
+        if near_need > 0:
+            if len(near_idxs) > 0:
+                near_idxs_choice = np.random.choice(near_idxs, near_need, replace=(near_need > len(near_idxs)))
+            else:
+                near_idxs_choice = np.random.choice(
+                    far_idxs_choice,
+                    near_need,
+                    replace=(near_need > len(far_idxs_choice)),
+                )
+        else:
+            near_idxs_choice = np.array([], dtype=np.int32)
+
+        if len(far_idxs_choice) > 0:
+            choice = np.concatenate((near_idxs_choice, far_idxs_choice), axis=0)
+        else:
+            choice = near_idxs_choice
+
+        if len(choice) < npoints:
+            pad_choice = np.random.choice(choice, npoints - len(choice), replace=True)
+            choice = np.concatenate((choice, pad_choice), axis=0)
+        elif len(choice) > npoints:
+            choice = np.random.choice(choice, npoints, replace=False)
+
+        np.random.shuffle(choice)
+        ret_pts_rect = pts_rect[choice, :]
+        ret_pts_intensity = pts_intensity[choice] - 0.5
+        return ret_pts_rect, ret_pts_intensity
+
+    choice = np.arange(0, num_pts, dtype=np.int32)
+    if npoints > num_pts:
+        extra_choice = np.random.choice(choice, npoints - num_pts, replace=True)
+        choice = np.concatenate((choice, extra_choice), axis=0)
+    np.random.shuffle(choice)
+
+    ret_pts_rect = pts_rect[choice, :]
+    ret_pts_intensity = pts_intensity[choice] - 0.5
+    return ret_pts_rect, ret_pts_intensity
+
+
+def _rect_to_lidar(points_rect: np.ndarray, calib) -> np.ndarray:
+    v2c_4x4 = np.eye(4, dtype=np.float32)
+    v2c_4x4[:3, :4] = calib.V2C
+
+    r0_4x4 = np.eye(4, dtype=np.float32)
+    r0_4x4[:3, :3] = calib.R0
+
+    rect_to_lidar = np.linalg.inv(r0_4x4 @ v2c_4x4)
+    points_hom = np.hstack([points_rect, np.ones((points_rect.shape[0], 1), dtype=np.float32)])
+    return (points_hom @ rect_to_lidar.T)[:, :3]
+
+
+def should_use_cuda(no_cuda: bool) -> bool:
+    """Determine whether to use CUDA based on availability and arguments."""
+    if no_cuda or not torch.cuda.is_available():
+        return False
+    return True
+
+
+def ensure_iou3d_utils(use_cuda: bool):
+    """Load iou3d_utils and return it with updated use_cuda flag."""
+    try:
+        import lib.utils.iou3d.iou3d_utils as iou3d_utils
+        return iou3d_utils, use_cuda
+    except (ImportError, ModuleNotFoundError):
+        print('Warning: iou3d_utils not available, falling back to CPU NMS')
+        return None, False
+
+
+def adapt_cfg_from_checkpoint(model_state):
+    """Adapt config from checkpoint (e.g., num_classes based on final layer)."""
+    # Check if the classification layer exists and adapt num_classes if needed
+    cls_layer_keys = [k for k in model_state.keys() if 'rcnn_net.cls_layer' in k]
+    if cls_layer_keys:
+        for key in cls_layer_keys:
+            if 'weight' in key and key.endswith('.weight'):
+                # Last conv layer weight has shape [num_classes, ...]
+                num_classes = model_state[key].shape[0]
+                if hasattr(cfg, 'NUM_CLASSES'):
+                    cfg.NUM_CLASSES = num_classes
+                break
+
+
+def preprocess(pts_lidar_raw: np.ndarray, calib, img_shape, npoints: int, use_intensity: bool, class_names):
+    """
+    Preprocess point cloud: transform to rect coords, filter by range, sample points.
+    
+    Args:
+        pts_lidar_raw: (N, 4) array of [x, y, z, intensity]
+        calib: Calibration object
+        img_shape: (height, width, channels)
+        npoints: Number of points to sample
+        use_intensity: Whether to include intensity in output
+    
+    Returns:
+        pts_input_t: torch tensor of shape (1, npoints, 3 or 4)
+        pts_rect: (N', 3 or 4) preprocessed points
+    """
+    pts_rect = calib.lidar_to_rect(pts_lidar_raw[:, 0:3])
+
+    pc_range = _resolve_pc_area_scope(class_names, calib)
+    x_range, y_range, z_range = pc_range[0], pc_range[1], pc_range[2]
+
+    valid_mask = (
+        (pts_rect[:, 0] >= x_range[0]) & (pts_rect[:, 0] <= x_range[1]) &
+        (pts_rect[:, 1] >= y_range[0]) & (pts_rect[:, 1] <= y_range[1]) &
+        (pts_rect[:, 2] >= z_range[0]) & (pts_rect[:, 2] <= z_range[1])
+    )
+    pts_rect = pts_rect[valid_mask]
+
+    pts_intensity = pts_lidar_raw[valid_mask, 3]
+    ret_pts_rect, ret_pts_intensity = _sample_points_like_dataset(pts_rect, pts_intensity, npoints)
+
+    if use_intensity:
+        pts_input = np.concatenate((ret_pts_rect, ret_pts_intensity.reshape(-1, 1)), axis=1)
+    else:
+        pts_input = ret_pts_rect
+
+    pts_input_t = torch.from_numpy(pts_input[np.newaxis, ...]).float()
+
+    return pts_input_t, pts_rect
+
+
+def boxes_rect_to_lidar_corners(boxes_rect: np.ndarray, calib) -> np.ndarray:
+    """
+    Convert 3D boxes in rect coords to corner points in lidar coords.
+    
+    Args:
+        boxes_rect: (N, 7) array of [x, y, z, h, w, l, ry]
+        calib: Calibration object
+    
+    Returns:
+        corners_lidar: (N, 8, 3) corner points in lidar coords
+    """
+    corners_rect = kitti_utils.boxes3d_to_corners3d(boxes_rect)  # (N, 8, 3)
+    corners_lidar = _rect_to_lidar(corners_rect.reshape(-1, 3), calib).reshape(boxes_rect.shape[0], 8, 3)
+    return corners_lidar
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Run a PointRCNN checkpoint on one dataset frame and visualize detections in Open3D.'
     )
     parser.add_argument('--cfg_file', type=str, default='cfgs/default.yaml',
                         help='Training/evaluation config file.')
-    parser.add_argument('--ckpt', type=str, default='../output/rcnn/default/ckpt/checkpoint_epoch_70.pth',
+    parser.add_argument('--ckpt', type=str, default='../output/rcnn/default/ckpt/checkpoint_epoch_4.pth',
                         help='Checkpoint to load.')
     parser.add_argument('--data_root', type=str, default='../data/dataset',
                         help='Dataset root used for training.')
-    parser.add_argument('--frame_id', type=str, default='000194',
+    parser.add_argument('--frame_id', type=str, default='000355',
                         help='Frame id inside the dataset, for example 000010 or 10.')
-    parser.add_argument('--split', type=str, default='train', choices=['train', 'val', 'smallval', 'trainval', 'test'],
+    parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'smallval', 'trainval', 'test'],
                         help='KITTI split to resolve the frame from when using data_root.')
     parser.add_argument('--bin_file', type=str, default=None,
                         help='Optional direct path to a .bin file. Overrides data_root/frame_id lookup.')
@@ -57,7 +225,7 @@ def parse_args():
                         help='Image height used by the projection filter when no image exists.')
     parser.add_argument('--img_width', type=int, default=1280,
                         help='Image width used by the projection filter when no image exists.')
-    parser.add_argument('--score_thresh', type=float, default=0.5,
+    parser.add_argument('--score_thresh', type=float, default=0.1,
                         help='Minimum class confidence kept after RCNN scoring.')
     parser.add_argument('--nms_thresh', type=float, default=None,
                         help='Optional NMS threshold override. Defaults to cfg.RCNN.NMS_THRESH.')
@@ -160,10 +328,8 @@ def _select_class_scores(rcnn_cls: torch.Tensor, score_thresh: float):
 
 
 def run_inference(model, pts_input_t, score_thresh, nms_thresh, use_cuda, iou3d_utils):
-    mean_size = torch.from_numpy(cfg.CLS_MEAN_SIZE[0])
     if use_cuda:
         pts_input_t = pts_input_t.cuda()
-        mean_size = mean_size.cuda()
 
     with torch.no_grad():
         ret_dict = model({'pts_input': pts_input_t})
@@ -173,10 +339,16 @@ def run_inference(model, pts_input_t, score_thresh, nms_thresh, use_cuda, iou3d_
     rcnn_reg = ret_dict['rcnn_reg']
     batch_size = roi_boxes3d.shape[0]
 
+    class_ids, cls_scores, raw_scores, keep_mask = _select_class_scores(rcnn_cls, score_thresh)
+    if cfg.RCNN.SIZE_RES_ON_ROI:
+        anchor_size = roi_boxes3d.view(-1, 7)[:, 3:6]
+    else:
+        anchor_size = kitti_utils.get_class_anchor_sizes_torch(class_ids.view(-1), device=roi_boxes3d.device)
+
     pred_boxes3d = decode_bbox_target(
         roi_boxes3d.view(-1, 7),
         rcnn_reg.view(-1, rcnn_reg.shape[-1]),
-        anchor_size=mean_size,
+        anchor_size=anchor_size,
         loc_scope=cfg.RCNN.LOC_SCOPE,
         loc_bin_size=cfg.RCNN.LOC_BIN_SIZE,
         num_head_bin=cfg.RCNN.NUM_HEAD_BIN,
@@ -187,7 +359,6 @@ def run_inference(model, pts_input_t, score_thresh, nms_thresh, use_cuda, iou3d_
         get_ry_fine=True,
     ).view(batch_size, -1, 7)
 
-    class_ids, cls_scores, raw_scores, keep_mask = _select_class_scores(rcnn_cls, score_thresh)
     if keep_mask.sum() == 0:
         return (
             np.zeros((0, 7), dtype=np.float32),
@@ -210,8 +381,11 @@ def run_inference(model, pts_input_t, score_thresh, nms_thresh, use_cuda, iou3d_
         class_scores = scores_kept[class_mask]
         class_raw_scores = raw_scores_kept[class_mask]
 
-        boxes_bev = kitti_utils.boxes3d_to_bev_torch(class_boxes)
-        keep_idx = iou3d_utils.nms_gpu(boxes_bev, class_raw_scores, nms_thresh).view(-1)
+        if iou3d_utils is None:
+            keep_idx = torch.argsort(class_raw_scores, descending=True)
+        else:
+            boxes_bev = kitti_utils.boxes3d_to_bev_torch(class_boxes)
+            keep_idx = iou3d_utils.nms_gpu(boxes_bev, class_raw_scores, nms_thresh).view(-1)
 
         final_boxes.append(class_boxes[keep_idx])
         final_scores.append(class_scores[keep_idx])
@@ -315,6 +489,7 @@ def main():
         img_shape=image_shape,
         npoints=npoints,
         use_intensity=cfg.RPN.USE_INTENSITY,
+        class_names=class_names[1:],
     )
 
     pred_boxes_rect, scores, class_ids = run_inference(

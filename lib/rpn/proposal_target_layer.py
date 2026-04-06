@@ -14,6 +14,9 @@ class ProposalTargetLayer(nn.Module):
     def forward(self, input_dict):
         roi_boxes3d, gt_boxes3d = input_dict['roi_boxes3d'], input_dict['gt_boxes3d']
 
+        if gt_boxes3d.shape[-1] < 8:
+            raise ValueError('RCNN multi-class training requires gt_boxes3d to include class ids in the 8th column')
+
         batch_rois, batch_gt_of_rois, batch_roi_iou, batch_cls_label = self.sample_rois_for_rcnn(roi_boxes3d, gt_boxes3d)
 
         rpn_xyz, rpn_features = input_dict['rpn_xyz'], input_dict['rpn_features']
@@ -58,8 +61,7 @@ class ProposalTargetLayer(nn.Module):
         # regression valid mask
         valid_mask = (pooled_empty_flag == 0)
         reg_valid_mask = ((batch_roi_iou > cfg.RCNN.REG_FG_THRESH) & valid_mask).long()
-
-        # batch_cls_label is now computed in sample_rois_for_rcnn and returned
+        batch_cls_label[valid_mask == 0] = -1
 
         output_dict = {'sampled_pts': sampled_pts.view(-1, cfg.RCNN.NUM_POINTS, 3),
                    'pts_feature': sampled_features.view(-1, cfg.RCNN.NUM_POINTS, sampled_features.shape[3]),
@@ -97,8 +99,11 @@ class ProposalTargetLayer(nn.Module):
                 k -= 1
             cur_gt = cur_gt[:k + 1]
 
+            gt_boxes = cur_gt[:, 0:7]
+            gt_classes = cur_gt[:, 7].long()
+
             # include gt boxes in the candidate rois
-            iou3d = iou3d_utils.boxes_iou3d_gpu(cur_roi, cur_gt[:, 0:7])  # (M, N)
+            iou3d = iou3d_utils.boxes_iou3d_gpu(cur_roi, gt_boxes)  # (M, N)
 
             max_overlaps, gt_assignment = torch.max(iou3d, dim=1)
 
@@ -130,30 +135,25 @@ class ProposalTargetLayer(nn.Module):
                 bg_inds = self.sample_bg_inds(hard_bg_inds, easy_bg_inds, bg_rois_per_this_image)
                 fg_rois_per_this_image = 0
             else:
-                import pdb
-                pdb.set_trace()
-                raise NotImplementedError
+                raise NotImplementedError('No foreground or background ROIs available for ProposalTargetLayer')
 
             roi_list, roi_iou_list, roi_gt_list = [], [], []
             cls_label = batch_cls_label[idx]
+            cls_label.zero_()
             if fg_rois_per_this_image > 0:
                 fg_rois_src = cur_roi[fg_inds]
-                gt_of_fg_rois = cur_gt[gt_assignment[fg_inds]]
+                gt_of_fg_rois = gt_boxes[gt_assignment[fg_inds]]
                 iou3d_src = max_overlaps[fg_inds]
                 fg_rois, fg_iou3d = self.aug_roi_by_noise_torch(fg_rois_src, gt_of_fg_rois, iou3d_src,
                                                                 aug_times=cfg.RCNN.ROI_FG_AUG_TIMES)
                 roi_list.append(fg_rois)
                 roi_iou_list.append(fg_iou3d)
                 roi_gt_list.append(gt_of_fg_rois)
-                # Assign class index from GT for fg
-                if gt_boxes3d.shape[-1] > 7:
-                    matched_gt_classes = cur_gt[gt_assignment[fg_inds], 7].long()
-                else:
-                    matched_gt_classes = torch.ones_like(fg_inds)
+                matched_gt_classes = gt_classes[gt_assignment[fg_inds]]
                 cls_label[:fg_rois_per_this_image] = matched_gt_classes
             if bg_rois_per_this_image > 0:
                 bg_rois_src = cur_roi[bg_inds]
-                gt_of_bg_rois = cur_gt[gt_assignment[bg_inds]]
+                gt_of_bg_rois = gt_boxes[gt_assignment[bg_inds]]
                 iou3d_src = max_overlaps[bg_inds]
                 aug_times = 1 if cfg.RCNN.ROI_FG_AUG_TIMES > 0 else 0
                 bg_rois, bg_iou3d = self.aug_roi_by_noise_torch(bg_rois_src, gt_of_bg_rois, iou3d_src,
@@ -161,15 +161,12 @@ class ProposalTargetLayer(nn.Module):
                 roi_list.append(bg_rois)
                 roi_iou_list.append(bg_iou3d)
                 roi_gt_list.append(gt_of_bg_rois)
-                # bg ROIs remain as class 0 (background)
             rois = torch.cat(roi_list, dim=0)
             iou_of_rois = torch.cat(roi_iou_list, dim=0)
             gt_of_rois = torch.cat(roi_gt_list, dim=0)
 
             # Set invalids to -1 (ignore)
             invalid_mask = (iou_of_rois > cfg.RCNN.CLS_BG_THRESH) & (iou_of_rois < cfg.RCNN.CLS_FG_THRESH)
-            valid_mask = (torch.cat([torch.ones_like(fg_inds), torch.ones_like(bg_inds)]) if fg_rois_per_this_image > 0 or bg_rois_per_this_image > 0 else torch.zeros_like(rois[:,0])).bool()
-            cls_label[valid_mask == 0] = -1
             cls_label[invalid_mask > 0] = -1
 
             batch_rois[idx] = rois

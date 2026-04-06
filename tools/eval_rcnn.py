@@ -72,7 +72,112 @@ def create_logger(log_file):
     return logging.getLogger(__name__)
 
 
-def save_kitti_format(sample_id, calib, bbox3d, kitti_output_dir, scores, img_shape, gt_labels=None, gt_boxes3d=None):
+def _get_default_mean_size_torch(device):
+    return torch.from_numpy(kitti_utils.get_default_mean_size()).to(device=device, dtype=torch.float32)
+
+
+def _get_gt_boxes_and_classes(dataset, sample_id, gt_boxes3d):
+    if isinstance(gt_boxes3d, torch.Tensor):
+        gt_boxes_np = gt_boxes3d.detach().cpu().numpy()
+    else:
+        gt_boxes_np = np.asarray(gt_boxes3d)
+
+    if gt_boxes_np.size == 0:
+        return np.zeros((0, 7), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+
+    gt_boxes_np = gt_boxes_np.reshape(gt_boxes_np.shape[0], -1)
+    gt_boxes = gt_boxes_np[:, 0:7].astype(np.float32)
+    valid_mask = np.abs(gt_boxes).sum(axis=1) > 0
+    gt_boxes = gt_boxes[valid_mask]
+
+    if gt_boxes_np.shape[1] > 7:
+        gt_class_ids = gt_boxes_np[:, 7].astype(np.int64)[valid_mask]
+        return gt_boxes, gt_class_ids
+
+    filtered_labels = dataset.filtrate_objects(dataset.get_label(sample_id))
+    gt_class_ids = np.array([dataset.get_class_idx(obj.cls_type) for obj in filtered_labels], dtype=np.int64)
+    if gt_class_ids.shape[0] != gt_boxes.shape[0]:
+        gt_class_ids = gt_class_ids[:gt_boxes.shape[0]]
+    return gt_boxes, gt_class_ids
+
+
+def _select_rcnn_scores_flat(rcnn_cls):
+    if rcnn_cls.shape[1] == 1:
+        raw_scores = rcnn_cls.view(-1)
+        norm_scores = torch.sigmoid(raw_scores)
+        pred_classes = (norm_scores > cfg.RCNN.SCORE_THRESH).long()
+        return pred_classes, raw_scores, norm_scores
+
+    pred_classes = torch.argmax(rcnn_cls, dim=1)
+    cls_norm_scores = F.softmax(rcnn_cls, dim=1)
+    gather_idx = pred_classes.unsqueeze(1)
+    raw_scores = torch.gather(rcnn_cls, 1, gather_idx).squeeze(1)
+    norm_scores = torch.gather(cls_norm_scores, 1, gather_idx).squeeze(1)
+    return pred_classes, raw_scores, norm_scores
+
+
+def _select_rcnn_scores_batch(rcnn_cls):
+    if rcnn_cls.shape[2] == 1:
+        raw_scores = rcnn_cls.squeeze(2)
+        norm_scores = torch.sigmoid(raw_scores)
+        pred_classes = (norm_scores > cfg.RCNN.SCORE_THRESH).long()
+        return pred_classes, raw_scores, norm_scores
+
+    pred_classes = torch.argmax(rcnn_cls, dim=2)
+    cls_norm_scores = F.softmax(rcnn_cls, dim=2)
+    gather_idx = pred_classes.unsqueeze(2)
+    raw_scores = torch.gather(rcnn_cls, 2, gather_idx).squeeze(2)
+    norm_scores = torch.gather(cls_norm_scores, 2, gather_idx).squeeze(2)
+    return pred_classes, raw_scores, norm_scores
+
+
+def _decode_boxes_for_classes(roi_boxes3d, rcnn_reg, pred_classes):
+    anchor_size = kitti_utils.get_class_anchor_sizes_torch(pred_classes, device=roi_boxes3d.device)
+    return decode_bbox_target(
+        roi_boxes3d,
+        rcnn_reg,
+        anchor_size=anchor_size,
+        loc_scope=cfg.RCNN.LOC_SCOPE,
+        loc_bin_size=cfg.RCNN.LOC_BIN_SIZE,
+        num_head_bin=cfg.RCNN.NUM_HEAD_BIN,
+        get_xz_fine=True,
+        get_y_by_bin=cfg.RCNN.LOC_Y_BY_BIN,
+        loc_y_scope=cfg.RCNN.LOC_Y_SCOPE,
+        loc_y_bin_size=cfg.RCNN.LOC_Y_BIN_SIZE,
+        get_ry_fine=True,
+    )
+
+
+def _build_roi_class_targets(iou_matrix, gt_class_ids, fg_thresh, bg_thresh):
+    if iou_matrix.shape[1] == 0:
+        num_preds = iou_matrix.shape[0]
+        target_classes = torch.zeros(num_preds, dtype=torch.long, device=iou_matrix.device)
+        valid_mask = torch.ones(num_preds, dtype=torch.bool, device=iou_matrix.device)
+        return target_classes, valid_mask, torch.zeros(num_preds, device=iou_matrix.device)
+
+    gt_class_tensor = torch.as_tensor(gt_class_ids, dtype=torch.long, device=iou_matrix.device)
+    best_iou, best_assignment = iou_matrix.max(dim=1)
+    target_classes = gt_class_tensor[best_assignment]
+    target_classes = target_classes.clone()
+    target_classes[best_iou <= bg_thresh] = 0
+    valid_mask = (best_iou >= fg_thresh) | (best_iou <= bg_thresh)
+    target_classes[~valid_mask] = -1
+    return target_classes, valid_mask, best_iou
+
+
+def _class_names_from_ids(class_ids, class_names):
+    det_names = []
+    for class_id in class_ids:
+        class_idx = int(class_id)
+        if 0 <= class_idx < len(class_names):
+            det_names.append(class_names[class_idx])
+        else:
+            det_names.append(class_names[0])
+    return det_names
+
+
+def save_kitti_format(sample_id, calib, bbox3d, kitti_output_dir, scores, img_shape, det_class_names=None,
+                      default_class_name='Car'):
     corners3d = kitti_utils.boxes3d_to_corners3d(bbox3d)
     img_boxes, _ = calib.corners3d_to_img_boxes(corners3d)
 
@@ -94,24 +199,7 @@ def save_kitti_format(sample_id, calib, bbox3d, kitti_output_dir, scores, img_sh
             beta = np.arctan2(z, x)
             alpha = -np.sign(beta) * np.pi / 2 + beta + ry
 
-            # Get class name from ground truth matching
-            class_name = 'Car'  # default
-            if gt_labels is not None and len(gt_labels) > 0 and gt_boxes3d is not None:
-                # Match this proposal to closest ground truth by IoU
-                gt_boxes_np = gt_boxes3d.cpu().numpy() if hasattr(gt_boxes3d, 'cpu') else np.array(gt_boxes3d)
-                valid_mask = np.sum(np.abs(gt_boxes_np[:, 0:7]), axis=1) > 0
-                if np.any(valid_mask):
-                    valid_gt_boxes = gt_boxes_np[valid_mask]
-                    try:
-                        iou = iou3d_utils.boxes_iou3d_gpu(
-                            torch.from_numpy(bbox3d[k:k+1]).cuda().float(),
-                            torch.from_numpy(valid_gt_boxes[:, 0:7]).cuda().float()
-                        ).cpu().numpy()[0]
-                        best_idx = np.argmax(iou)
-                        if iou[best_idx] > 0.01:
-                            class_name = gt_labels[np.where(valid_mask)[0][best_idx]].cls_type
-                    except:
-                        pass
+            class_name = det_class_names[k] if det_class_names is not None else default_class_name
             
             print('%s -1 -1 %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f' %
                 (class_name, alpha, img_boxes[k, 0], img_boxes[k, 1], img_boxes[k, 2], img_boxes[k, 3],
@@ -219,28 +307,28 @@ def eval_one_epoch_rpn(model, dataloader, epoch_id, result_dir, logger):
 
                 recalled_num = 0
                 if cur_gt_boxes3d.shape[0] > 0:
-                    # Get ground truth labels for per-class recall tracking
-                    gt_labels = dataset.get_label(cur_sample_id)
-                    gt_class_ids = np.array([dataset.classes.index(label.cls_type) - 1 for label in gt_labels
-                                            if label.cls_type in dataset.classes])  # -1 to exclude background
-                    
-                    iou3d = iou3d_utils.boxes_iou3d_gpu(cur_boxes3d, cur_gt_boxes3d[:, 0:7])
-                    gt_max_iou, _ = iou3d.max(dim=0)
+                    cur_gt_boxes_np, gt_class_ids = _get_gt_boxes_and_classes(dataset, cur_sample_id, cur_gt_boxes3d)
+                    if cur_gt_boxes_np.shape[0] > 0:
+                        gt_class_ids = gt_class_ids - 1  # exclude background
 
-                    for idx, thresh in enumerate(thresh_list):
-                        total_recalled_bbox_list[idx] += (gt_max_iou > thresh).sum().item()
-                        # Per-class recall
+                        iou3d = iou3d_utils.boxes_iou3d_gpu(
+                            cur_boxes3d,
+                            torch.from_numpy(cur_gt_boxes_np).cuda(non_blocking=True).float(),
+                        )
+                        gt_max_iou, _ = iou3d.max(dim=0)
+
+                        for idx, thresh in enumerate(thresh_list):
+                            total_recalled_bbox_list[idx] += (gt_max_iou > thresh).sum().item()
+                            for class_idx in range(num_classes):
+                                class_mask = gt_class_ids == class_idx
+                                if class_mask.sum() > 0:
+                                    per_class_recalled_bbox_list[class_idx][idx] += (gt_max_iou[class_mask] > thresh).sum().item()
+
+                        recalled_num = (gt_max_iou > 0.7).sum().item()
+                        total_gt_bbox += cur_gt_boxes_np.shape[0]
+
                         for class_idx in range(num_classes):
-                            class_mask = gt_class_ids == class_idx
-                            if class_mask.sum() > 0:
-                                per_class_recalled_bbox_list[class_idx][idx] += (gt_max_iou[class_mask] > thresh).sum().item()
-                    
-                    recalled_num = (gt_max_iou > 0.7).sum().item()
-                    total_gt_bbox += cur_gt_boxes3d.__len__()
-                    
-                    # Per-class GT count
-                    for class_idx in range(num_classes):
-                        per_class_gt_bbox[class_idx] += (gt_class_ids == class_idx).sum()
+                            per_class_gt_bbox[class_idx] += (gt_class_ids == class_idx).sum()
 
                 fg_mask = cur_rpn_cls_label > 0
                 correct = ((cur_seg_result == cur_rpn_cls_label) & fg_mask).sum().float()
@@ -274,15 +362,16 @@ def eval_one_epoch_rpn(model, dataloader, epoch_id, result_dir, logger):
                 calib = dataset.get_calib(cur_sample_id)
                 cur_boxes3d = cur_boxes3d.cpu().numpy()
                 image_shape = dataset.get_image_shape(cur_sample_id)
-                
-                # Get ground truth labels and boxes for proposal classification
-                gt_labels = None
-                gt_boxes = None
-                if not args.test and cur_gt_boxes3d.shape[0] > 0:
-                    gt_labels = dataset.get_label(cur_sample_id)
-                    gt_boxes = cur_gt_boxes3d
-                
-                save_kitti_format(cur_sample_id, calib, cur_boxes3d, kitti_output_dir, cur_scores_raw, image_shape, gt_labels=gt_labels, gt_boxes3d=gt_boxes)
+
+                save_kitti_format(
+                    cur_sample_id,
+                    calib,
+                    cur_boxes3d,
+                    kitti_output_dir,
+                    cur_scores_raw,
+                    image_shape,
+                    default_class_name=class_names[0] if class_names else 'Car',
+                )
 
         disp_dict = {'mode': mode, 'recall': '%d/%d' % (total_recalled_bbox_list[3], total_gt_bbox),
                      'rpn_iou': rpn_iou_avg / max(cnt, 1.0)}
@@ -335,7 +424,6 @@ def eval_one_epoch_rpn(model, dataloader, epoch_id, result_dir, logger):
 
 def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
     np.random.seed(1024)
-    MEAN_SIZE = torch.from_numpy(cfg.CLS_MEAN_SIZE[0]).cuda()
     mode = 'TEST' if args.test else 'EVAL'
 
     final_output_dir = os.path.join(result_dir, 'final_result', 'data')
@@ -389,31 +477,24 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
         rcnn_cls = ret_dict['rcnn_cls']
         rcnn_reg = ret_dict['rcnn_reg']
 
-        # bounding box regression
-        anchor_size = MEAN_SIZE
+        pred_classes, raw_scores, norm_scores = _select_rcnn_scores_flat(rcnn_cls)
+
         if cfg.RCNN.SIZE_RES_ON_ROI:
-            roi_size = input_data['roi_size']
-            anchor_size = roi_size
-
-        pred_boxes3d = decode_bbox_target(roi_boxes3d, rcnn_reg,
-                                          anchor_size=anchor_size,
-                                          loc_scope=cfg.RCNN.LOC_SCOPE,
-                                          loc_bin_size=cfg.RCNN.LOC_BIN_SIZE,
-                                          num_head_bin=cfg.RCNN.NUM_HEAD_BIN,
-                                          get_xz_fine=True, get_y_by_bin=cfg.RCNN.LOC_Y_BY_BIN,
-                                          loc_y_scope=cfg.RCNN.LOC_Y_SCOPE, loc_y_bin_size=cfg.RCNN.LOC_Y_BIN_SIZE,
-                                          get_ry_fine=True)
-
-        # scoring
-        if rcnn_cls.shape[1] == 1:
-            raw_scores = rcnn_cls.view(-1)
-            norm_scores = torch.sigmoid(raw_scores)
-            pred_classes = (norm_scores > cfg.RCNN.SCORE_THRESH).long()
+            pred_boxes3d = decode_bbox_target(
+                roi_boxes3d,
+                rcnn_reg,
+                anchor_size=input_data['roi_size'],
+                loc_scope=cfg.RCNN.LOC_SCOPE,
+                loc_bin_size=cfg.RCNN.LOC_BIN_SIZE,
+                num_head_bin=cfg.RCNN.NUM_HEAD_BIN,
+                get_xz_fine=True,
+                get_y_by_bin=cfg.RCNN.LOC_Y_BY_BIN,
+                loc_y_scope=cfg.RCNN.LOC_Y_SCOPE,
+                loc_y_bin_size=cfg.RCNN.LOC_Y_BIN_SIZE,
+                get_ry_fine=True,
+            )
         else:
-            pred_classes = torch.argmax(rcnn_cls, dim=1).view(-1)
-            cls_norm_scores = F.softmax(rcnn_cls, dim=1)
-            raw_scores = rcnn_cls[:, pred_classes]
-            norm_scores = cls_norm_scores[:, pred_classes]
+            pred_boxes3d = _decode_boxes_for_classes(roi_boxes3d, rcnn_reg, pred_classes)
 
         # evaluation
         disp_dict = {'mode': mode}
@@ -422,22 +503,19 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
             gt_iou = input_data['gt_iou']
 
             # calculate recall
-            gt_num = gt_boxes3d.shape[0]
+            gt_boxes_np, gt_class_ids = _get_gt_boxes_and_classes(dataset, sample_id, gt_boxes3d)
+            gt_num = gt_boxes_np.shape[0]
             if gt_num > 0:
-                # Get ground truth labels for per-class recall tracking
-                gt_labels = dataset.get_label(sample_id)
-                gt_class_ids = np.array([dataset.classes.index(label.cls_type) - 1 for label in gt_labels
-                                        if label.cls_type in dataset.classes])  # -1 to exclude background
-                
-                iou3d = iou3d_utils.boxes_iou3d_gpu(pred_boxes3d, gt_boxes3d)
+                gt_boxes_tensor = torch.from_numpy(gt_boxes_np).cuda(non_blocking=True).float()
+                iou3d = iou3d_utils.boxes_iou3d_gpu(pred_boxes3d, gt_boxes_tensor)
                 gt_max_iou, _ = iou3d.max(dim=0)
-                refined_iou, _ = iou3d.max(dim=1)
+                gt_class_ids_no_bg = gt_class_ids - 1
 
                 for idx, thresh in enumerate(thresh_list):
                     total_recalled_bbox_list[idx] += (gt_max_iou > thresh).sum().item()
                     # Per-class recall
                     for class_idx in range(num_classes):
-                        class_mask = gt_class_ids == class_idx
+                        class_mask = gt_class_ids_no_bg == class_idx
                         if class_mask.sum() > 0:
                             per_class_recalled_bbox_list[class_idx][idx] += (gt_max_iou[class_mask] > thresh).sum().item()
                 
@@ -446,27 +524,38 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
                 
                 # Per-class GT count
                 for class_idx in range(num_classes):
-                    per_class_gt_bbox[class_idx] += (gt_class_ids == class_idx).sum()
+                    per_class_gt_bbox[class_idx] += (gt_class_ids_no_bg == class_idx).sum()
 
-                iou3d_in = iou3d_utils.boxes_iou3d_gpu(roi_boxes3d, gt_boxes3d)
+                iou3d_in = iou3d_utils.boxes_iou3d_gpu(roi_boxes3d, gt_boxes_tensor)
                 gt_max_iou_in, _ = iou3d_in.max(dim=0)
 
                 for idx, thresh in enumerate(thresh_list):
                     total_roi_recalled_bbox_list[idx] += (gt_max_iou_in > thresh).sum().item()
                     # Per-class ROI recall
                     for class_idx in range(num_classes):
-                        class_mask = gt_class_ids == class_idx
+                        class_mask = gt_class_ids_no_bg == class_idx
                         if class_mask.sum() > 0:
                             per_class_roi_recalled_bbox_list[class_idx][idx] += (gt_max_iou_in[class_mask] > thresh).sum().item()
 
-            # classification accuracy
-            cls_label = (gt_iou > cfg.RCNN.CLS_FG_THRESH).float()
-            cls_valid_mask = ((gt_iou >= cfg.RCNN.CLS_FG_THRESH) | (gt_iou <= cfg.RCNN.CLS_BG_THRESH)).float()
-            cls_acc = ((pred_classes == cls_label.long()).float() * cls_valid_mask).sum() / max(cls_valid_mask.sum(), 1.0)
-
-            iou_thresh = 0.7 if cfg.CLASSES == 'Car' else 0.5
-            cls_label_refined = (gt_iou >= iou_thresh).float()
-            cls_acc_refined = (pred_classes == cls_label_refined.long()).float().sum() / max(cls_label_refined.shape[0], 1.0)
+                roi_target_classes, roi_valid_mask, _ = _build_roi_class_targets(
+                    iou3d_in,
+                    gt_class_ids,
+                    cfg.RCNN.CLS_FG_THRESH,
+                    cfg.RCNN.CLS_BG_THRESH,
+                )
+                refined_target_classes, refined_valid_mask, _ = _build_roi_class_targets(
+                    iou3d,
+                    gt_class_ids,
+                    0.7 if cfg.CLASSES == 'Car' else 0.5,
+                    0.7 if cfg.CLASSES == 'Car' else 0.5,
+                )
+                cls_acc = ((pred_classes == roi_target_classes).float() * roi_valid_mask.float()).sum() / \
+                    torch.clamp(roi_valid_mask.float().sum(), min=1.0)
+                cls_acc_refined = ((pred_classes == refined_target_classes).float() * refined_valid_mask.float()).sum() / \
+                    torch.clamp(refined_valid_mask.float().sum(), min=1.0)
+            else:
+                cls_acc = pred_classes.new_tensor(0.0).float()
+                cls_acc_refined = pred_classes.new_tensor(0.0).float()
 
             total_cls_acc += cls_acc.item()
             total_cls_acc_refined += cls_acc_refined.item()
@@ -483,10 +572,13 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
             roi_boxes3d_np = roi_boxes3d.cpu().numpy()
             pred_boxes3d_np = pred_boxes3d.cpu().numpy()
             calib = dataset.get_calib(sample_id)
+            pred_class_names = _class_names_from_ids(pred_classes.cpu().numpy(), dataset.classes)
 
-            save_kitti_format(sample_id, calib, roi_boxes3d_np, roi_output_dir, roi_scores, image_shape)
+            save_kitti_format(sample_id, calib, roi_boxes3d_np, roi_output_dir, roi_scores, image_shape,
+                              default_class_name=class_names[0] if class_names else 'Car')
             save_kitti_format(sample_id, calib, pred_boxes3d_np, refine_output_dir, raw_scores.cpu().numpy(),
-                              image_shape)
+                              image_shape, det_class_names=pred_class_names,
+                              default_class_name=class_names[0] if class_names else 'Car')
 
         # NMS and scoring
         # scores thresh
@@ -496,6 +588,7 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
 
         pred_boxes3d_selected = pred_boxes3d[inds]
         raw_scores_selected = raw_scores[inds]
+        pred_classes_selected = pred_classes[inds]
 
         # NMS thresh
         boxes_bev_selected = kitti_utils.boxes3d_to_bev_torch(pred_boxes3d_selected)
@@ -503,11 +596,15 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
         pred_boxes3d_selected = pred_boxes3d_selected[keep_idx]
 
         scores_selected = raw_scores_selected[keep_idx]
+        pred_classes_selected = pred_classes_selected[keep_idx]
         pred_boxes3d_selected, scores_selected = pred_boxes3d_selected.cpu().numpy(), scores_selected.cpu().numpy()
+        det_class_names = _class_names_from_ids(pred_classes_selected.cpu().numpy(), dataset.classes)
 
         calib = dataset.get_calib(sample_id)
         final_total += pred_boxes3d_selected.shape[0]
-        save_kitti_format(sample_id, calib, pred_boxes3d_selected, final_output_dir, scores_selected, image_shape)
+        save_kitti_format(sample_id, calib, pred_boxes3d_selected, final_output_dir, scores_selected, image_shape,
+                  det_class_names=det_class_names,
+                  default_class_name=class_names[0] if class_names else 'Car')
 
     progress_bar.close()
 
@@ -579,10 +676,13 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
     if cfg.TEST.SPLIT != 'test':
         logger.info('Averate Precision:')
         name_to_class = {'Car': 0, 'Pedestrian': 1, 'Cyclist': 2}
-        ap_result_str, ap_dict = kitti_evaluate(dataset.label_dir, final_output_dir, label_split_file=split_file,
-                                                current_class=name_to_class[cfg.CLASSES])
-        logger.info(ap_result_str)
-        ret_dict.update(ap_dict)
+        if cfg.CLASSES in name_to_class:
+            ap_result_str, ap_dict = kitti_evaluate(dataset.label_dir, final_output_dir, label_split_file=split_file,
+                                                    current_class=name_to_class[cfg.CLASSES])
+            logger.info(ap_result_str)
+            ret_dict.update(ap_dict)
+        else:
+            logger.info('Skipping legacy KITTI AP evaluation for custom class config: %s', cfg.CLASSES)
 
     logger.info('result is saved to: %s' % result_dir)
 
@@ -591,7 +691,6 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
 
 def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
     np.random.seed(666)
-    MEAN_SIZE = torch.from_numpy(cfg.CLS_MEAN_SIZE[0]).cuda()
     mode = 'TEST' if args.test else 'EVAL'
 
     final_output_dir = os.path.join(result_dir, 'final_result', 'data')
@@ -625,10 +724,10 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
 
     progress_bar = tqdm.tqdm(total=len(dataloader), leave=True, desc='eval')
     for data in dataloader:
-        cnt += 1
         sample_id, pts_rect, pts_features, pts_input = \
             data['sample_id'], data['pts_rect'], data['pts_features'], data['pts_input']
         batch_size = len(sample_id)
+        cnt += batch_size
         inputs = torch.from_numpy(pts_input).cuda(non_blocking=True).float()
         input_data = {'pts_input': inputs}
 
@@ -642,31 +741,27 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
         rcnn_cls = ret_dict['rcnn_cls'].view(batch_size, -1, ret_dict['rcnn_cls'].shape[1])
         rcnn_reg = ret_dict['rcnn_reg'].view(batch_size, -1, ret_dict['rcnn_reg'].shape[1])  # (B, M, C)
 
-        # bounding box regression
-        anchor_size = MEAN_SIZE
+        pred_classes, raw_scores, norm_scores = _select_rcnn_scores_batch(rcnn_cls)
         if cfg.RCNN.SIZE_RES_ON_ROI:
-            assert False
-
-        pred_boxes3d = decode_bbox_target(roi_boxes3d.view(-1, 7), rcnn_reg.view(-1, rcnn_reg.shape[-1]),
-                                          anchor_size=anchor_size,
-                                          loc_scope=cfg.RCNN.LOC_SCOPE,
-                                          loc_bin_size=cfg.RCNN.LOC_BIN_SIZE,
-                                          num_head_bin=cfg.RCNN.NUM_HEAD_BIN,
-                                          get_xz_fine=True, get_y_by_bin=cfg.RCNN.LOC_Y_BY_BIN,
-                                          loc_y_scope=cfg.RCNN.LOC_Y_SCOPE, loc_y_bin_size=cfg.RCNN.LOC_Y_BIN_SIZE,
-                                          get_ry_fine=True).view(batch_size, -1, 7)
-
-        # scoring
-        if rcnn_cls.shape[2] == 1:
-            raw_scores = rcnn_cls  # (B, M, 1)
-
-            norm_scores = torch.sigmoid(raw_scores)
-            pred_classes = (norm_scores > cfg.RCNN.SCORE_THRESH).long()
+            pred_boxes3d = decode_bbox_target(
+                roi_boxes3d.view(-1, 7),
+                rcnn_reg.view(-1, rcnn_reg.shape[-1]),
+                anchor_size=roi_boxes3d[:, :, 3:6].contiguous().view(-1, 3),
+                loc_scope=cfg.RCNN.LOC_SCOPE,
+                loc_bin_size=cfg.RCNN.LOC_BIN_SIZE,
+                num_head_bin=cfg.RCNN.NUM_HEAD_BIN,
+                get_xz_fine=True,
+                get_y_by_bin=cfg.RCNN.LOC_Y_BY_BIN,
+                loc_y_scope=cfg.RCNN.LOC_Y_SCOPE,
+                loc_y_bin_size=cfg.RCNN.LOC_Y_BIN_SIZE,
+                get_ry_fine=True,
+            ).view(batch_size, -1, 7)
         else:
-            pred_classes = torch.argmax(rcnn_cls, dim=1).view(-1)
-            cls_norm_scores = F.softmax(rcnn_cls, dim=1)
-            raw_scores = rcnn_cls[:, pred_classes]
-            norm_scores = cls_norm_scores[:, pred_classes]
+            pred_boxes3d = _decode_boxes_for_classes(
+                roi_boxes3d.view(-1, 7),
+                rcnn_reg.view(-1, rcnn_reg.shape[-1]),
+                pred_classes.view(-1),
+            ).view(batch_size, -1, 7)
 
         # evaluation
         recalled_num = gt_num = rpn_iou = 0
@@ -689,21 +784,17 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
                 if tmp_idx >= 0:
                     cur_gt_boxes3d = cur_gt_boxes3d[:tmp_idx + 1]
 
-                    cur_gt_boxes3d = torch.from_numpy(cur_gt_boxes3d).cuda(non_blocking=True).float()
+                    cur_gt_boxes_np, gt_class_ids = _get_gt_boxes_and_classes(dataset, cur_sample_id, cur_gt_boxes3d)
+                    cur_gt_boxes3d = torch.from_numpy(cur_gt_boxes_np).cuda(non_blocking=True).float()
                     iou3d = iou3d_utils.boxes_iou3d_gpu(pred_boxes3d[k], cur_gt_boxes3d)
                     gt_max_iou, _ = iou3d.max(dim=0)
-                    refined_iou, _ = iou3d.max(dim=1)
-
-                    # Get ground truth labels for per-class recall tracking
-                    gt_labels = dataset.get_label(cur_sample_id)
-                    gt_class_ids = np.array([dataset.classes.index(label.cls_type) - 1 for label in gt_labels
-                                            if label.cls_type in dataset.classes])  # -1 to exclude background
+                    gt_class_ids_no_bg = gt_class_ids - 1
 
                     for idx, thresh in enumerate(thresh_list):
                         total_recalled_bbox_list[idx] += (gt_max_iou > thresh).sum().item()
                         # Per-class recall
                         for class_idx in range(num_classes):
-                            class_mask = gt_class_ids == class_idx
+                            class_mask = gt_class_ids_no_bg == class_idx
                             if class_mask.sum() > 0:
                                 per_class_recalled_bbox_list[class_idx][idx] += (gt_max_iou[class_mask] > thresh).sum().item()
                     
@@ -713,7 +804,7 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
                     
                     # Per-class GT count
                     for class_idx in range(num_classes):
-                        per_class_gt_bbox[class_idx] += (gt_class_ids == class_idx).sum()
+                        per_class_gt_bbox[class_idx] += (gt_class_ids_no_bg == class_idx).sum()
 
                     # original recall
                     iou3d_in = iou3d_utils.boxes_iou3d_gpu(roi_boxes3d[k], cur_gt_boxes3d)
@@ -723,9 +814,28 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
                         total_roi_recalled_bbox_list[idx] += (gt_max_iou_in > thresh).sum().item()
                         # Per-class ROI recall
                         for class_idx in range(num_classes):
-                            class_mask = gt_class_ids == class_idx
+                            class_mask = gt_class_ids_no_bg == class_idx
                             if class_mask.sum() > 0:
                                 per_class_roi_recalled_bbox_list[class_idx][idx] += (gt_max_iou_in[class_mask] > thresh).sum().item()
+
+                    roi_target_classes, roi_valid_mask, _ = _build_roi_class_targets(
+                        iou3d_in,
+                        gt_class_ids,
+                        cfg.RCNN.CLS_FG_THRESH,
+                        cfg.RCNN.CLS_BG_THRESH,
+                    )
+                    refined_target_classes, refined_valid_mask, _ = _build_roi_class_targets(
+                        iou3d,
+                        gt_class_ids,
+                        0.7 if cfg.CLASSES == 'Car' else 0.5,
+                        0.7 if cfg.CLASSES == 'Car' else 0.5,
+                    )
+                    cls_acc = ((pred_classes[k] == roi_target_classes).float() * roi_valid_mask.float()).sum() / \
+                        torch.clamp(roi_valid_mask.float().sum(), min=1.0)
+                    cls_acc_refined = ((pred_classes[k] == refined_target_classes).float() * refined_valid_mask.float()).sum() / \
+                        torch.clamp(refined_valid_mask.float().sum(), min=1.0)
+                    total_cls_acc += cls_acc.item()
+                    total_cls_acc_refined += cls_acc_refined.item()
 
                 if not cfg.RPN.FIXED:
                     fg_mask = rpn_cls_label > 0
@@ -756,9 +866,13 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
                 calib = dataset.get_calib(cur_sample_id)
                 image_shape = dataset.get_image_shape(cur_sample_id)
                 save_kitti_format(cur_sample_id, calib, roi_boxes3d_np[k], roi_output_dir,
-                                  roi_scores_raw_np[k], image_shape)
+                                  roi_scores_raw_np[k], image_shape,
+                                  default_class_name=class_names[0] if class_names else 'Car')
+                pred_class_names = _class_names_from_ids(pred_classes[k].cpu().numpy(), dataset.classes)
                 save_kitti_format(cur_sample_id, calib, pred_boxes3d_np[k], refine_output_dir,
-                                  raw_scores_np[k], image_shape)
+                                  raw_scores_np[k], image_shape,
+                                  det_class_names=pred_class_names,
+                                  default_class_name=class_names[0] if class_names else 'Car')
 
                 output_file = os.path.join(rpn_output_dir, '%06d.npy' % cur_sample_id)
                 np.save(output_file, output_data.astype(np.float32))
@@ -773,7 +887,7 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
 
             pred_boxes3d_selected = pred_boxes3d[k, cur_inds]
             raw_scores_selected = raw_scores[k, cur_inds]
-            norm_scores_selected = norm_scores[k, cur_inds]
+            pred_classes_selected = pred_classes[k, cur_inds]
 
             # NMS thresh
             # rotated nms
@@ -781,13 +895,17 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
             keep_idx = iou3d_utils.nms_gpu(boxes_bev_selected, raw_scores_selected, cfg.RCNN.NMS_THRESH).view(-1)
             pred_boxes3d_selected = pred_boxes3d_selected[keep_idx]
             scores_selected = raw_scores_selected[keep_idx]
+            pred_classes_selected = pred_classes_selected[keep_idx]
             pred_boxes3d_selected, scores_selected = pred_boxes3d_selected.cpu().numpy(), scores_selected.cpu().numpy()
+            det_class_names = _class_names_from_ids(pred_classes_selected.cpu().numpy(), dataset.classes)
 
             cur_sample_id = sample_id[k]
             calib = dataset.get_calib(cur_sample_id)
             final_total += pred_boxes3d_selected.shape[0]
             image_shape = dataset.get_image_shape(cur_sample_id)
-            save_kitti_format(cur_sample_id, calib, pred_boxes3d_selected, final_output_dir, scores_selected, image_shape)
+            save_kitti_format(cur_sample_id, calib, pred_boxes3d_selected, final_output_dir, scores_selected,
+                              image_shape, det_class_names=det_class_names,
+                              default_class_name=class_names[0] if class_names else 'Car')
 
     progress_bar.close()
     # dump empty files
@@ -861,10 +979,13 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
     if cfg.TEST.SPLIT != 'test':
         logger.info('Averate Precision:')
         name_to_class = {'Car': 0, 'Pedestrian': 1, 'Cyclist': 2}
-        ap_result_str, ap_dict = kitti_evaluate(dataset.label_dir, final_output_dir, label_split_file=split_file,
-                                                current_class=name_to_class[cfg.CLASSES])
-        logger.info(ap_result_str)
-        ret_dict.update(ap_dict)
+        if cfg.CLASSES in name_to_class:
+            ap_result_str, ap_dict = kitti_evaluate(dataset.label_dir, final_output_dir, label_split_file=split_file,
+                                                    current_class=name_to_class[cfg.CLASSES])
+            logger.info(ap_result_str)
+            ret_dict.update(ap_dict)
+        else:
+            logger.info('Skipping legacy KITTI AP evaluation for custom class config: %s', cfg.CLASSES)
 
     logger.info('result is saved to: %s' % result_dir)
     return ret_dict

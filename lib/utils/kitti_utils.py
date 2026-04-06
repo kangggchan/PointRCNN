@@ -3,6 +3,7 @@ from scipy.spatial import Delaunay
 import scipy
 import lib.utils.object3d as object3d
 import torch
+from lib.config import cfg
 
 
 def get_objects_from_label(label_file):
@@ -209,6 +210,65 @@ def objs_to_scores(obj_list):
     for k, obj in enumerate(obj_list):
         scores[k] = obj.score
     return scores
+
+
+def get_mean_size_array():
+    mean_size_cfg = np.asarray(cfg.CLS_MEAN_SIZE, dtype=np.float32)
+    if mean_size_cfg.ndim == 1:
+        return mean_size_cfg.reshape(1, -1)
+    return mean_size_cfg
+
+
+def get_size_template_count():
+    return int(get_mean_size_array().shape[0])
+
+
+def get_default_mean_size():
+    mean_size_cfg = get_mean_size_array()
+    if mean_size_cfg.shape[0] == 1:
+        return mean_size_cfg[0]
+    return mean_size_cfg.mean(axis=0)
+
+
+def get_mean_size_tensor(device=None):
+    return torch.as_tensor(get_mean_size_array(), dtype=torch.float32, device=device)
+
+
+def get_anchor_sizes_by_template_ids_torch(template_ids, device=None):
+    mean_sizes = get_mean_size_tensor(device=device)
+    template_ids = template_ids.long().view(-1)
+
+    if mean_sizes.shape[0] == 1:
+        return mean_sizes[0].unsqueeze(0).repeat(template_ids.shape[0], 1)
+
+    clamped_ids = template_ids.clamp(min=0, max=mean_sizes.shape[0] - 1)
+    return mean_sizes[clamped_ids]
+
+
+def get_size_template_ids_torch(box_sizes, device=None):
+    mean_sizes = get_mean_size_tensor(device=device)
+    box_sizes = box_sizes.view(-1, 3).to(device=mean_sizes.device, dtype=torch.float32)
+
+    if mean_sizes.shape[0] == 1:
+        return torch.zeros(box_sizes.shape[0], dtype=torch.long, device=mean_sizes.device)
+
+    denom = torch.clamp(mean_sizes.unsqueeze(0), min=1e-6)
+    normalized_dist = torch.abs(box_sizes.unsqueeze(1) - mean_sizes.unsqueeze(0)) / denom
+    return torch.argmin(normalized_dist.sum(dim=2), dim=1)
+
+
+def get_class_anchor_sizes_torch(class_ids, device=None):
+    mean_sizes = get_mean_size_tensor(device=device)
+    default_mean = torch.as_tensor(get_default_mean_size(), dtype=torch.float32, device=device)
+
+    class_ids = class_ids.long().view(-1)
+    anchor_sizes = default_mean.unsqueeze(0).repeat(class_ids.shape[0], 1)
+
+    fg_mask = (class_ids > 0) & (class_ids <= mean_sizes.shape[0])
+    if fg_mask.any():
+        anchor_sizes[fg_mask] = mean_sizes[class_ids[fg_mask] - 1]
+
+    return anchor_sizes
 
 
 def get_iou3d(corners3d, query_corners3d, need_bev=False):

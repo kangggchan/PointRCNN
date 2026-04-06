@@ -10,33 +10,39 @@ class ProposalLayer(nn.Module):
     def __init__(self, mode='TRAIN'):
         super().__init__()
         self.mode = mode
-        mean_size_cfg = cfg.CLS_MEAN_SIZE
-        if mean_size_cfg.ndim == 2 and mean_size_cfg.shape[0] > 1:
-            mean_size_cfg = mean_size_cfg.mean(axis=0)
-        else:
-            mean_size_cfg = mean_size_cfg[0]
-        self.MEAN_SIZE = torch.from_numpy(mean_size_cfg).float()
+        self.mean_sizes = torch.from_numpy(kitti_utils.get_mean_size_array()).float()
+        self.num_size_templates = self.mean_sizes.shape[0]
 
     def forward(self, rpn_scores, rpn_reg, xyz):
         """
         :param rpn_scores: (B, N)
-        :param rpn_reg: (B, N, 8)
+        :param rpn_reg: (B, N, C)
         :param xyz: (B, N, 3)
         :return bbox3d: (B, M, 7)
         """
         batch_size = xyz.shape[0]
-        proposals = decode_bbox_target(xyz.view(-1, 3), rpn_reg.view(-1, rpn_reg.shape[-1]),
-                                       anchor_size=self.MEAN_SIZE.to(xyz.device),
-                                       loc_scope=cfg.RPN.LOC_SCOPE,
-                                       loc_bin_size=cfg.RPN.LOC_BIN_SIZE,
-                                       num_head_bin=cfg.RPN.NUM_HEAD_BIN,
-                                       get_xz_fine=cfg.RPN.LOC_XZ_FINE,
-                                       get_y_by_bin=False,
-                                       get_ry_fine=False)  # (N, 7)
-        proposals[:, 1] += proposals[:, 3] / 2  # set y as the center of bottom
-        proposals = proposals.view(batch_size, -1, 7)
+        flat_xyz = xyz.view(-1, 3)
+        flat_reg = rpn_reg.view(-1, rpn_reg.shape[-1])
+        proposal_list = []
+        for template_idx in range(self.num_size_templates):
+            template_ids = torch.full((flat_xyz.shape[0],), template_idx, dtype=torch.long, device=xyz.device)
+            template_proposals = decode_bbox_target(
+                flat_xyz,
+                flat_reg,
+                anchor_size=self.mean_sizes[template_idx].to(xyz.device),
+                loc_scope=cfg.RPN.LOC_SCOPE,
+                loc_bin_size=cfg.RPN.LOC_BIN_SIZE,
+                num_head_bin=cfg.RPN.NUM_HEAD_BIN,
+                get_xz_fine=cfg.RPN.LOC_XZ_FINE,
+                get_y_by_bin=False,
+                get_ry_fine=False,
+                size_template_ids=template_ids,
+            )
+            template_proposals[:, 1] += template_proposals[:, 3] / 2  # set y as the center of bottom
+            proposal_list.append(template_proposals.view(batch_size, -1, 7))
 
-        scores = rpn_scores
+        proposals = torch.cat(proposal_list, dim=1)
+        scores = rpn_scores.repeat(1, self.num_size_templates)
         _, sorted_idxs = torch.sort(scores, dim=1, descending=True)
 
         batch_size = scores.size(0)

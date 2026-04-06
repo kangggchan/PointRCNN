@@ -11,6 +11,9 @@ def boxes_iou_bev(boxes_a, boxes_b):
         ans_iou: (M, N)
     """
 
+    if boxes_a.shape[0] == 0 or boxes_b.shape[0] == 0:
+        return boxes_a.new_zeros((boxes_a.shape[0], boxes_b.shape[0]))
+
     ans_iou = torch.cuda.FloatTensor(torch.Size((boxes_a.shape[0], boxes_b.shape[0]))).zero_()
 
     iou3d_cuda.boxes_iou_bev_gpu(boxes_a.contiguous(), boxes_b.contiguous(), ans_iou)
@@ -25,6 +28,9 @@ def boxes_iou3d_gpu(boxes_a, boxes_b):
     :return:
         ans_iou: (M, N)
     """
+    if boxes_a.shape[0] == 0 or boxes_b.shape[0] == 0:
+        return boxes_a.new_zeros((boxes_a.shape[0], boxes_b.shape[0]))
+
     boxes_a_bev = kitti_utils.boxes3d_to_bev_torch(boxes_a)
     boxes_b_bev = kitti_utils.boxes3d_to_bev_torch(boxes_b)
 
