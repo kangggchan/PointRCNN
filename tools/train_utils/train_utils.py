@@ -99,20 +99,39 @@ def load_checkpoint(model=None, optimizer=None, filename='checkpoint', logger=cu
     return it, epoch
 
 
-def load_part_ckpt(model, filename, logger=cur_logger, total_keys=-1):
+def load_part_ckpt(model, filename, logger=cur_logger, total_keys=-1, strict_shape=False):
     if os.path.isfile(filename):
         logger.info("==> Loading part model from checkpoint '{}'".format(filename))
         checkpoint = _torch_load_compat(filename)
-        model_state = checkpoint['model_state']
+        model_state = checkpoint.get('model_state', checkpoint)
 
-        update_model_state = {key: val for key, val in model_state.items() if key in model.state_dict()}
         state_dict = model.state_dict()
+        update_model_state = {}
+        shape_mismatch_keys = []
+        for key, val in model_state.items():
+            if key not in state_dict:
+                continue
+            if state_dict[key].shape != val.shape:
+                shape_mismatch_keys.append(key)
+                continue
+            update_model_state[key] = val
+
+        if shape_mismatch_keys:
+            preview = ', '.join(shape_mismatch_keys[:5])
+            suffix = '...' if len(shape_mismatch_keys) > 5 else ''
+            message = "Found %d keys with shape mismatch: %s%s" % (
+                len(shape_mismatch_keys), preview, suffix
+            )
+            if strict_shape:
+                raise RuntimeError(message)
+            logger.warning("==> Skipped %s", message)
+
         state_dict.update(update_model_state)
         model.load_state_dict(state_dict)
 
         update_keys = update_model_state.keys().__len__()
         if update_keys == 0:
-            raise RuntimeError
+            raise RuntimeError("No compatible keys found when loading partial checkpoint: %s" % filename)
         logger.info("==> Done (loaded %d/%d)" % (update_keys, total_keys))
     else:
         raise FileNotFoundError

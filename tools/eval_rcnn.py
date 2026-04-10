@@ -838,9 +838,9 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
                     total_cls_acc_refined += cls_acc_refined.item()
 
                 if not cfg.RPN.FIXED:
-                    fg_mask = rpn_cls_label > 0
-                    correct = ((seg_result == rpn_cls_label) & fg_mask).sum().float()
-                    union = fg_mask.sum().float() + (seg_result > 0).sum().float() - correct
+                    fg_mask = rpn_cls_label[k] > 0
+                    correct = ((seg_result[k] == rpn_cls_label[k]) & fg_mask).sum().float()
+                    union = fg_mask.sum().float() + (seg_result[k] > 0).sum().float() - correct
                     rpn_iou = correct / torch.clamp(union, min=1.0)
                     total_rpn_iou += rpn_iou.item()
 
@@ -1003,20 +1003,40 @@ def eval_one_epoch(model, dataloader, epoch_id, result_dir, logger):
     return ret_dict
 
 
-def load_part_ckpt(model, filename, logger, total_keys=-1):
+def load_part_ckpt(model, filename, logger, total_keys=-1, strict_shape=False):
     if os.path.isfile(filename):
         logger.info("==> Loading part model from checkpoint '{}'".format(filename))
-        checkpoint = torch.load(filename)
-        model_state = checkpoint['model_state']
+        checkpoint = _torch_load_compat(filename)
+        model_state = checkpoint.get('model_state', checkpoint)
 
-        update_model_state = {key: val for key, val in model_state.items() if key in model.state_dict()}
+        state_dict = model.state_dict()
+        update_model_state = {}
+        shape_mismatch_keys = []
+        for key, val in model_state.items():
+            if key not in state_dict:
+                continue
+            if state_dict[key].shape != val.shape:
+                shape_mismatch_keys.append(key)
+                continue
+            update_model_state[key] = val
+
+        if shape_mismatch_keys:
+            preview = ', '.join(shape_mismatch_keys[:5])
+            suffix = '...' if len(shape_mismatch_keys) > 5 else ''
+            message = "Found %d keys with shape mismatch: %s%s" % (
+                len(shape_mismatch_keys), preview, suffix
+            )
+            if strict_shape:
+                raise RuntimeError(message)
+            logger.warning("==> Skipped %s", message)
+
         state_dict = model.state_dict()
         state_dict.update(update_model_state)
         model.load_state_dict(state_dict)
 
         update_keys = update_model_state.keys().__len__()
         if update_keys == 0:
-            raise RuntimeError
+            raise RuntimeError("No compatible keys found when loading partial checkpoint: %s" % filename)
         logger.info("==> Done (loaded %d/%d)" % (update_keys, total_keys))
     else:
         raise FileNotFoundError
@@ -1024,20 +1044,30 @@ def load_part_ckpt(model, filename, logger, total_keys=-1):
 
 def load_ckpt_based_on_args(model, logger):
     if args.ckpt is not None:
-        train_utils.load_checkpoint(model, filename=args.ckpt, logger=logger)
+        try:
+            train_utils.load_checkpoint(model, filename=args.ckpt, logger=logger)
+        except RuntimeError as err:
+            msg = str(err)
+            if 'Missing key(s)' in msg or 'size mismatch' in msg:
+                logger.warning('Full checkpoint load failed, trying partial load for --ckpt')
+                load_part_ckpt(model, filename=args.ckpt, logger=logger,
+                               total_keys=model.state_dict().keys().__len__(), strict_shape=False)
+            else:
+                raise
 
     total_keys = model.state_dict().keys().__len__()
     if cfg.RPN.ENABLED and args.rpn_ckpt is not None:
-        load_part_ckpt(model, filename=args.rpn_ckpt, logger=logger, total_keys=total_keys)
+        load_part_ckpt(model, filename=args.rpn_ckpt, logger=logger, total_keys=total_keys, strict_shape=True)
 
     if cfg.RCNN.ENABLED and args.rcnn_ckpt is not None:
-        load_part_ckpt(model, filename=args.rcnn_ckpt, logger=logger, total_keys=total_keys)
+        load_part_ckpt(model, filename=args.rcnn_ckpt, logger=logger, total_keys=total_keys, strict_shape=True)
 
 
 def eval_single_ckpt(root_result_dir):
     root_result_dir = os.path.join(root_result_dir, 'eval')
     # set epoch_id and output dir
-    num_list = re.findall(r'\d+', args.ckpt) if args.ckpt is not None else []
+    epoch_src = args.ckpt if args.ckpt is not None else args.rcnn_ckpt
+    num_list = re.findall(r'\d+', epoch_src) if epoch_src is not None else []
     epoch_id = num_list[-1] if num_list.__len__() > 0 else 'no_number'
     root_result_dir = os.path.join(root_result_dir, 'epoch_%s' % epoch_id, cfg.TEST.SPLIT)
     if args.test:
@@ -1193,6 +1223,12 @@ if __name__ == "__main__":
         assert args.rcnn_eval_roi_dir is not None and args.rcnn_eval_feature_dir is not None
     else:
         raise NotImplementedError
+
+    if args.eval_mode == 'rcnn' and not cfg.RCNN.ROI_SAMPLE_JIT:
+        cfg.RCNN.ROI_SAMPLE_JIT = True
+
+    if args.eval_mode == 'rcnn' and args.ckpt is None and (args.rpn_ckpt is None or args.rcnn_ckpt is None):
+        raise ValueError('eval_mode=rcnn requires --ckpt, or both --rpn_ckpt and --rcnn_ckpt.')
 
     if args.ckpt_dir is not None:
         ckpt_dir = args.ckpt_dir

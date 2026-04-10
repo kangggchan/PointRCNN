@@ -403,9 +403,8 @@ class KittiRCNNDataset(KittiDataset):
         gt_boxes3d_with_cls = self.objs_to_gt_boxes3d(gt_obj_list, with_classes=True)
         # Use pre-detected format (detected once during init, not per-batch)
 
-        gt_alpha = np.zeros((gt_obj_list.__len__()), dtype=np.float32)
-        for k, obj in enumerate(gt_obj_list):
-            gt_alpha[k] = obj.alpha
+        temp_beta = np.arctan2(gt_boxes3d[:, 2], gt_boxes3d[:, 0]).astype(np.float64)
+        gt_alpha = (-np.sign(temp_beta) * np.pi / 2 + temp_beta + gt_boxes3d[:, 6]).astype(np.float32)
 
         # data augmentation
         aug_pts_rect = ret_pts_rect.copy()

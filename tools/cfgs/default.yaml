@@ -138,7 +138,7 @@ TRAIN:
     SPLIT: train_aug
     VAL_SPLIT: smallval
 
-    LR: 0.0005
+    LR: 0.0001
     LR_CLIP: 0.00001
     LR_DECAY: 0.5
     DECAY_STEP_LIST: [100, 150, 180, 200]

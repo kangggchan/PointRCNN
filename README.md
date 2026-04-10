@@ -277,22 +277,28 @@ python train_rcnn.py ... --skip_preprocess
 - Make sure all `.bin` are `float32` with shape `N x 4` (`x y z intensity`).
 
 ## 10) Utilities
-###To check class balance inside KITTI folder before generate DB
+### To check class balance inside KITTI folder before generate DB
 ```bash
 python tools/check_class_balance.py
 ```
 
-###To compute mean of bounding box by class
+### To compute mean of bounding box by class
 ```bash
 python tools/compute_cls_mean_size.py
 ```
 
-###To visualize augemented scenes in Open3D (replaace 000000 with the ID of the frame):
+### To visualize a pointcloud frame with label in Open3D:
 ```bash
-python tools/verify_bin_conversion.py --idx 000000
+python tools/verify_bin_conversion.py
 ```
 
-###To enable Open3D GUI in WSL:
+### To run inference for final rcnn model with a specific pointcloud frame
+```bash
+python infer_frame_open3d.py  \
+  --bin_file path_to_bin_file
+```
+
+### To enable Open3D GUI in WSL:
 ```bash
 unset WAYLAND_DISPLAY
 export XDG_SESSION_TYPE=x11

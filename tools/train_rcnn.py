@@ -147,7 +147,7 @@ def create_optimizer(model):
     return optimizer
 
 
-def create_scheduler(optimizer, total_steps, last_epoch):
+def create_scheduler(model, optimizer, total_steps, last_epoch):
     def lr_lbmd(cur_epoch):
         cur_decay = 1
         for decay_step in cfg.TRAIN.DECAY_STEP_LIST:
@@ -193,6 +193,14 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError
 
+    if args.train_mode == 'rcnn' and args.ckpt is None and args.rpn_ckpt is None:
+        raise ValueError('train_mode=rcnn requires --rpn_ckpt (or --ckpt to resume).')
+
+    if args.train_mode == 'rcnn_offline':
+        if args.rcnn_training_roi_dir is None or args.rcnn_training_feature_dir is None:
+            raise ValueError('train_mode=rcnn_offline requires both --rcnn_training_roi_dir and '
+                             '--rcnn_training_feature_dir.')
+
     if args.output_dir is not None:
         root_result_dir = args.output_dir
     os.makedirs(root_result_dir, exist_ok=True)
@@ -237,13 +245,19 @@ if __name__ == "__main__":
         it, start_epoch = train_utils.load_checkpoint(pure_model, optimizer, filename=args.ckpt, logger=logger)
         last_epoch = start_epoch + 1
 
-    lr_scheduler, bnm_scheduler = create_scheduler(optimizer, total_steps=len(train_loader) * args.epochs,
+    lr_scheduler, bnm_scheduler = create_scheduler(model, optimizer, total_steps=len(train_loader) * args.epochs,
                                                    last_epoch=last_epoch)
 
     if args.rpn_ckpt is not None:
         pure_model = model.module if isinstance(model, torch.nn.DataParallel) else model
         total_keys = pure_model.state_dict().keys().__len__()
-        train_utils.load_part_ckpt(pure_model, filename=args.rpn_ckpt, logger=logger, total_keys=total_keys)
+        train_utils.load_part_ckpt(
+            pure_model,
+            filename=args.rpn_ckpt,
+            logger=logger,
+            total_keys=total_keys,
+            strict_shape=True,
+        )
 
     if cfg.TRAIN.LR_WARMUP and cfg.TRAIN.OPTIMIZER != 'adam_onecycle':
         lr_warmup_scheduler = train_utils.CosineWarmupLR(optimizer, T_max=cfg.TRAIN.WARMUP_EPOCH * len(train_loader),
