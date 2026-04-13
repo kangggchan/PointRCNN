@@ -191,7 +191,7 @@ The original PointRCNN README notes that the offline augmentation strategy usual
 #### Step 1: Generate augmented scenes
 
 From `tools`:
-
+m,
 ```bash
 cd tools
 python generate_aug_scene.py \

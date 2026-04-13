@@ -4,7 +4,7 @@
   <version>0.1.0</version>
   <description>ROS2 PointRCNN node for realtime PointCloud2 inference and RViz box visualization.</description>
 
-  <maintainer email="user@example.com">PointRCNN User</maintainer>
+  <maintainer email="khang.buiphuoc@gmail.com">PointRCNN User</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_python</buildtool_depend>

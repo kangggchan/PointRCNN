@@ -1,9 +1,11 @@
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from lib.rpn.proposal_layer import ProposalLayer
 import pointnet2_lib.pointnet2.pytorch_utils as pt_utils
 import lib.utils.loss_utils as loss_utils
+import lib.utils.kitti_utils as kitti_utils
 from lib.config import cfg
 import importlib
 
@@ -12,6 +14,11 @@ class RPN(nn.Module):
     def __init__(self, use_xyz=True, mode='TRAIN'):
         super().__init__()
         self.training_mode = (mode == 'TRAIN')
+        self.num_size_templates = kitti_utils.get_size_template_count()
+        self.multi_class_cls = bool(cfg.RPN.MULTI_CLASS_CLS)
+
+        if self.multi_class_cls and cfg.RPN.LOSS_CLS != 'CrossEntropy':
+            raise ValueError('RPN.MULTI_CLASS_CLS requires cfg.RPN.LOSS_CLS = CrossEntropy')
 
         MODEL = importlib.import_module(cfg.RPN.BACKBONE)
         self.backbone_net = MODEL.get_model(input_channels=int(cfg.RPN.USE_INTENSITY), use_xyz=use_xyz)
@@ -19,10 +26,11 @@ class RPN(nn.Module):
         # classification branch
         cls_layers = []
         pre_channel = cfg.RPN.FP_MLPS[0][-1]
+        cls_channel = self.num_size_templates + 1 if self.multi_class_cls else 1
         for k in range(0, cfg.RPN.CLS_FC.__len__()):
             cls_layers.append(pt_utils.Conv1d(pre_channel, cfg.RPN.CLS_FC[k], bn=cfg.RPN.USE_BN))
             pre_channel = cfg.RPN.CLS_FC[k]
-        cls_layers.append(pt_utils.Conv1d(pre_channel, 1, activation=None))
+        cls_layers.append(pt_utils.Conv1d(pre_channel, cls_channel, activation=None))
         if cfg.RPN.DP_RATIO >= 0:
             cls_layers.insert(1, nn.Dropout(cfg.RPN.DP_RATIO))
         self.rpn_cls_layer = nn.Sequential(*cls_layers)
@@ -53,6 +61,9 @@ class RPN(nn.Module):
                                                                                gamma=cfg.RPN.FOCAL_GAMMA)
         elif cfg.RPN.LOSS_CLS == 'BinaryCrossEntropy':
             self.rpn_cls_loss_func = F.binary_cross_entropy
+        elif cfg.RPN.LOSS_CLS == 'CrossEntropy':
+            cls_weight = torch.from_numpy(cfg.RPN.CLS_WEIGHT).float()
+            self.rpn_cls_loss_func = nn.CrossEntropyLoss(ignore_index=-1, reduction='none', weight=cls_weight)
         else:
             raise NotImplementedError
 

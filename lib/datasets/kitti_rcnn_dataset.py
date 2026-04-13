@@ -414,10 +414,8 @@ class KittiRCNNDataset(KittiDataset):
                                                                               sample_id)
             sample_info['aug_method'] = aug_method
 
-        if cfg.RCNN.ENABLED:
-            aug_gt_boxes3d_with_cls = np.concatenate((aug_gt_boxes3d, gt_boxes3d_with_cls[:, 7:8].copy()), axis=1)
-        else:
-            aug_gt_boxes3d_with_cls = aug_gt_boxes3d
+        aug_gt_boxes3d_with_cls = np.concatenate((aug_gt_boxes3d, gt_boxes3d_with_cls[:, 7:8].copy()), axis=1)
+        sample_gt_boxes3d = aug_gt_boxes3d_with_cls if cfg.RCNN.ENABLED else aug_gt_boxes3d
 
         # prepare input
         if cfg.RPN.USE_INTENSITY:
@@ -429,31 +427,39 @@ class KittiRCNNDataset(KittiDataset):
             sample_info['pts_input'] = pts_input
             sample_info['pts_rect'] = aug_pts_rect
             sample_info['pts_features'] = ret_pts_features
-            sample_info['gt_boxes3d'] = aug_gt_boxes3d_with_cls
+            sample_info['gt_boxes3d'] = sample_gt_boxes3d
             return sample_info
 
         # generate training labels (using pre-detected format)
-        rpn_cls_label, rpn_reg_label = self.generate_rpn_training_labels(aug_pts_rect, aug_gt_boxes3d, self.boxes3d_format)
+        rpn_label_boxes3d = aug_gt_boxes3d_with_cls if cfg.RPN.MULTI_CLASS_CLS else aug_gt_boxes3d
+        rpn_cls_label, rpn_reg_label = self.generate_rpn_training_labels(
+            aug_pts_rect,
+            rpn_label_boxes3d,
+            self.boxes3d_format,
+        )
         sample_info['pts_input'] = pts_input
         sample_info['pts_rect'] = aug_pts_rect
         sample_info['pts_features'] = ret_pts_features
         sample_info['rpn_cls_label'] = rpn_cls_label
         sample_info['rpn_reg_label'] = rpn_reg_label
-        sample_info['gt_boxes3d'] = aug_gt_boxes3d_with_cls
+        sample_info['gt_boxes3d'] = sample_gt_boxes3d
         return sample_info
 
     @staticmethod
     def generate_rpn_training_labels(pts_rect, gt_boxes3d, boxes3d_format='kitti'):
         cls_label = np.zeros((pts_rect.shape[0]), dtype=np.int32)
         reg_label = np.zeros((pts_rect.shape[0], 7), dtype=np.float32)  # dx, dy, dz, ry, h, w, l
-        gt_corners = kitti_utils.boxes3d_to_corners3d(gt_boxes3d, rotate=True, format=boxes3d_format)
-        extend_gt_boxes3d = kitti_utils.enlarge_box3d(gt_boxes3d, extra_width=0.2)
+        gt_boxes3d_base = gt_boxes3d[:, 0:7]
+        use_class_labels = cfg.RPN.MULTI_CLASS_CLS and gt_boxes3d.shape[1] > 7
+
+        gt_corners = kitti_utils.boxes3d_to_corners3d(gt_boxes3d_base, rotate=True, format=boxes3d_format)
+        extend_gt_boxes3d = kitti_utils.enlarge_box3d(gt_boxes3d_base, extra_width=0.2)
         extend_gt_corners = kitti_utils.boxes3d_to_corners3d(extend_gt_boxes3d, rotate=True, format=boxes3d_format)
-        for k in range(gt_boxes3d.shape[0]):
+        for k in range(gt_boxes3d_base.shape[0]):
             box_corners = gt_corners[k]
             fg_pt_flag = kitti_utils.in_hull(pts_rect, box_corners)
             fg_pts_rect = pts_rect[fg_pt_flag]
-            cls_label[fg_pt_flag] = 1
+            cls_label[fg_pt_flag] = int(gt_boxes3d[k][7]) if use_class_labels else 1
 
             # enlarge the bbox3d, ignore nearby points
             extend_box_corners = extend_gt_corners[k]
@@ -462,15 +468,15 @@ class KittiRCNNDataset(KittiDataset):
             cls_label[ignore_flag] = -1
 
             # pixel offset of object center
-            center3d = gt_boxes3d[k][0:3].copy()  # (x, y, z)
-            center3d[1] -= gt_boxes3d[k][3] / 2
+            center3d = gt_boxes3d_base[k][0:3].copy()  # (x, y, z)
+            center3d[1] -= gt_boxes3d_base[k][3] / 2
             reg_label[fg_pt_flag, 0:3] = center3d - fg_pts_rect  # Now y is the true center of 3d box 20180928
 
             # size and angle encoding
-            reg_label[fg_pt_flag, 3] = gt_boxes3d[k][3]  # h
-            reg_label[fg_pt_flag, 4] = gt_boxes3d[k][4]  # w
-            reg_label[fg_pt_flag, 5] = gt_boxes3d[k][5]  # l
-            reg_label[fg_pt_flag, 6] = gt_boxes3d[k][6]  # ry
+            reg_label[fg_pt_flag, 3] = gt_boxes3d_base[k][3]  # h
+            reg_label[fg_pt_flag, 4] = gt_boxes3d_base[k][4]  # w
+            reg_label[fg_pt_flag, 5] = gt_boxes3d_base[k][5]  # l
+            reg_label[fg_pt_flag, 6] = gt_boxes3d_base[k][6]  # ry
 
         return cls_label, reg_label
 

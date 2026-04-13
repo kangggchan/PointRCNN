@@ -69,14 +69,16 @@ __C.RPN.REG_FC = [128]
 __C.RPN.DP_RATIO = 0.5
 
 # config of training
-__C.RPN.LOSS_CLS = 'DiceLoss'
+__C.RPN.LOSS_CLS = 'CrossEntropy'  # SigmoidFocalLoss, DiceLoss, CrossEntropy
 __C.RPN.FG_WEIGHT = 15
 __C.RPN.FOCAL_ALPHA = [0.25, 0.75]
 __C.RPN.FOCAL_GAMMA = 2.0
+__C.RPN.MULTI_CLASS_CLS = True
 __C.RPN.CLS_WEIGHT = np.array([1.0, 2.33, 0.37, 3.35, 1.78], dtype=np.float32)  # [bg, Car, Human, ForkLift, CargoBike]
 __C.RPN.REG_LOSS_WEIGHT = [1.0, 1.0, 1.0, 1.0]
 __C.RPN.LOSS_WEIGHT = [1.0, 1.0]
 __C.RPN.NMS_TYPE = 'normal'  # normal, rotate
+__C.RPN.FILTER_EMPTY_PROPOSALS = True
 
 # config of testing
 __C.RPN.SCORE_THRESH = 0.3

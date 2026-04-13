@@ -17,7 +17,7 @@ setup(
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='PointRCNN User',
-    maintainer_email='user@example.com',
+    maintainer_email='khang.buiphuoc@gmail.com',
     description='ROS2 PointRCNN node for realtime PointCloud2 inference and RViz box visualization.',
     license='MIT',
     entry_points={

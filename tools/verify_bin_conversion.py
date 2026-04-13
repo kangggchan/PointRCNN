@@ -146,8 +146,8 @@ def visualize(bin_file, label_file, class_filter=None, show_axes=True, axis_size
 
 def main():
     parser = argparse.ArgumentParser(description='Minimal project-format bin/label Open3D viewer')
-    parser.add_argument('--bin_file', type=str, default='../data/dataset/KITTI/aug_scene/training/rectified_data/010311.bin', help='Path to .bin file (camera frame Nx4 float32).')
-    parser.add_argument('--label_file', type=str, default='../output/rpn/default/eval/epoch_200/train_aug/detections/data/010311.txt', help='Path to KITTI label .txt file.')
+    parser.add_argument('--bin_file', type=str, default='../data/dataset/KITTI/aug_scene/training/rectified_data/020111.bin', help='Path to .bin file (camera frame Nx4 float32).')
+    parser.add_argument('--label_file', type=str, default='../output/rpn/default/eval/epoch_200/train_aug/detections/data/020111.txt', help='Path to KITTI label .txt file.')
     parser.add_argument('--class_filter', type=str, default=None, help='Optional class filter (exact label text).')
     parser.add_argument('--no_axes', action='store_true', help='Hide coordinate axes at origin.')
     parser.add_argument('--axis_size', type=float, default=2.5, help='Coordinate frame axis length in meters.')

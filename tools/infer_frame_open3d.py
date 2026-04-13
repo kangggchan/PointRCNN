@@ -32,9 +32,9 @@ BOX_EDGES = [
 def parse_args():
     parser = argparse.ArgumentParser(description='Simple PointRCNN frame inference + Open3D visualization.')
     parser.add_argument('--cfg_file', type=str, default='cfgs/default.yaml', help='Inference config file.')
-    parser.add_argument('--ckpt', type=str, default='../output/rcnn/default/ckpt/checkpoint_epoch_25.pth',
+    parser.add_argument('--ckpt', type=str, default='../output/rcnn/default/ckpt/checkpoint_epoch_13.pth',
                         help='Checkpoint to load.')
-    parser.add_argument('--bin_file', type=str, default='../data/dataset/KITTI/aug_scene/training/rectified_data/010212.bin',
+    parser.add_argument('--bin_file', type=str, default='../data/dataset/KITTI/aug_scene/training/rectified_data/010210.bin',
                         help='Direct path to a .bin file in camera frame.')
     parser.add_argument('--score_thresh', type=float, default=0.1, help='Minimum confidence threshold.')
     parser.add_argument('--nms_thresh', type=float, default=None, help='NMS threshold override.')
