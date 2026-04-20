@@ -59,6 +59,10 @@ parser.add_argument("--rcnn_eval_feature_dir", type=str, default=None,
                     help='specify the saved features for rcnn evaluation when using rcnn_offline mode')
 parser.add_argument('--set', dest='set_cfgs', default=None, nargs=argparse.REMAINDER,
                     help='set extra config keys if needed')
+parser.add_argument('--score_thresh', type=float, default=None,
+                    help='RCNN score threshold override. Defaults to cfg.RCNN.SCORE_THRESH.')
+parser.add_argument('--nms_thresh', type=float, default=None,
+                    help='RCNN NMS threshold override. Defaults to cfg.RCNN.NMS_THRESH.')
 args = parser.parse_args()
 
 
@@ -101,11 +105,11 @@ def _get_gt_boxes_and_classes(dataset, sample_id, gt_boxes3d):
     return gt_boxes, gt_class_ids
 
 
-def _select_rcnn_scores_flat(rcnn_cls):
+def _select_rcnn_scores_flat(rcnn_cls, score_thresh):
     if rcnn_cls.shape[1] == 1:
         raw_scores = rcnn_cls.view(-1)
         norm_scores = torch.sigmoid(raw_scores)
-        pred_classes = (norm_scores > cfg.RCNN.SCORE_THRESH).long()
+        pred_classes = (norm_scores > score_thresh).long()
         return pred_classes, raw_scores, norm_scores
 
     pred_classes = torch.argmax(rcnn_cls, dim=1)
@@ -116,11 +120,11 @@ def _select_rcnn_scores_flat(rcnn_cls):
     return pred_classes, raw_scores, norm_scores
 
 
-def _select_rcnn_scores_batch(rcnn_cls):
+def _select_rcnn_scores_batch(rcnn_cls, score_thresh):
     if rcnn_cls.shape[2] == 1:
         raw_scores = rcnn_cls.squeeze(2)
         norm_scores = torch.sigmoid(raw_scores)
-        pred_classes = (norm_scores > cfg.RCNN.SCORE_THRESH).long()
+        pred_classes = (norm_scores > score_thresh).long()
         return pred_classes, raw_scores, norm_scores
 
     pred_classes = torch.argmax(rcnn_cls, dim=2)
@@ -146,6 +150,60 @@ def _decode_boxes_for_classes(roi_boxes3d, rcnn_reg, pred_classes):
         loc_y_bin_size=cfg.RCNN.LOC_Y_BIN_SIZE,
         get_ry_fine=True,
     )
+
+
+def _get_eval_score_thresh():
+    if args.score_thresh is not None:
+        return float(args.score_thresh)
+    return float(cfg.RCNN.SCORE_THRESH)
+
+
+def _get_eval_nms_thresh():
+    if args.nms_thresh is not None:
+        return float(args.nms_thresh)
+    return float(cfg.RCNN.NMS_THRESH)
+
+
+def _postprocess_rcnn_detections(pred_boxes3d, pred_classes, raw_scores, norm_scores, score_thresh, nms_thresh):
+    empty_boxes = pred_boxes3d.new_zeros((0, pred_boxes3d.shape[-1]))
+    empty_scores = raw_scores.new_zeros((0,))
+    empty_classes = pred_classes.new_zeros((0,), dtype=torch.long)
+
+    if pred_boxes3d.shape[0] == 0:
+        return empty_boxes, empty_scores, empty_classes
+
+    pred_classes = pred_classes.long()
+    keep_mask = (norm_scores > score_thresh) & (pred_classes > 0)
+    if keep_mask.sum() == 0:
+        return empty_boxes, empty_scores, empty_classes
+
+    boxes_kept = pred_boxes3d[keep_mask]
+    raw_scores_kept = raw_scores[keep_mask]
+    class_ids_kept = pred_classes[keep_mask]
+
+    final_boxes, final_scores, final_class_ids = [], [], []
+    for class_id in torch.unique(class_ids_kept, sorted=True):
+        if int(class_id.item()) <= 0:
+            continue
+
+        class_mask = class_ids_kept == class_id
+        class_boxes = boxes_kept[class_mask]
+        class_raw_scores = raw_scores_kept[class_mask]
+        boxes_bev = kitti_utils.boxes3d_to_bev_torch(class_boxes)
+        keep_idx = iou3d_utils.nms_gpu(boxes_bev, class_raw_scores, nms_thresh).view(-1)
+
+        final_boxes.append(class_boxes[keep_idx])
+        final_scores.append(class_raw_scores[keep_idx])
+        final_class_ids.append(class_ids_kept[class_mask][keep_idx])
+
+    if not final_boxes:
+        return empty_boxes, empty_scores, empty_classes
+
+    final_boxes = torch.cat(final_boxes, dim=0)
+    final_scores = torch.cat(final_scores, dim=0)
+    final_class_ids = torch.cat(final_class_ids, dim=0)
+    sort_idx = torch.argsort(final_scores, descending=True)
+    return final_boxes[sort_idx], final_scores[sort_idx], final_class_ids[sort_idx]
 
 
 def _build_roi_class_targets(iou_matrix, gt_class_ids, fg_thresh, bg_thresh):
@@ -438,6 +496,8 @@ def eval_one_epoch_rpn(model, dataloader, epoch_id, result_dir, logger):
 def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
     np.random.seed(1024)
     mode = 'TEST' if args.test else 'EVAL'
+    score_thresh = _get_eval_score_thresh()
+    nms_thresh = _get_eval_nms_thresh()
 
     final_output_dir = os.path.join(result_dir, 'final_result', 'data')
     os.makedirs(final_output_dir, exist_ok=True)
@@ -449,6 +509,7 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
         os.makedirs(refine_output_dir, exist_ok=True)
 
     logger.info('---- EPOCH %s RCNN EVALUATION ----' % epoch_id)
+    logger.info('RCNN post-processing thresholds: score=%.3f, nms=%.3f' % (score_thresh, nms_thresh))
     model.eval()
 
     thresh_list = [0.1, 0.3, 0.5, 0.7, 0.9]
@@ -490,7 +551,7 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
         rcnn_cls = ret_dict['rcnn_cls']
         rcnn_reg = ret_dict['rcnn_reg']
 
-        pred_classes, raw_scores, norm_scores = _select_rcnn_scores_flat(rcnn_cls)
+        pred_classes, raw_scores, norm_scores = _select_rcnn_scores_flat(rcnn_cls, score_thresh)
 
         if cfg.RCNN.SIZE_RES_ON_ROI:
             pred_boxes3d = decode_bbox_target(
@@ -584,32 +645,27 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
             # save roi and refine results
             roi_boxes3d_np = roi_boxes3d.cpu().numpy()
             pred_boxes3d_np = pred_boxes3d.cpu().numpy()
+            roi_scores_np = roi_scores.cpu().numpy()
             calib = dataset.get_calib(sample_id)
             pred_class_names = _class_names_from_ids(pred_classes.cpu().numpy(), dataset.classes)
 
-            save_kitti_format(sample_id, calib, roi_boxes3d_np, roi_output_dir, roi_scores, image_shape,
+            save_kitti_format(sample_id, calib, roi_boxes3d_np, roi_output_dir, roi_scores_np, image_shape,
                               default_class_name=class_names[0] if class_names else 'Car')
             save_kitti_format(sample_id, calib, pred_boxes3d_np, refine_output_dir, raw_scores.cpu().numpy(),
                               image_shape, det_class_names=pred_class_names,
                               default_class_name=class_names[0] if class_names else 'Car')
 
-        # NMS and scoring
-        # scores thresh
-        inds = norm_scores > cfg.RCNN.SCORE_THRESH
-        if inds.sum() == 0:
+        pred_boxes3d_selected, scores_selected, pred_classes_selected = _postprocess_rcnn_detections(
+            pred_boxes3d,
+            pred_classes,
+            raw_scores,
+            norm_scores,
+            score_thresh,
+            nms_thresh,
+        )
+        if pred_boxes3d_selected.shape[0] == 0:
             continue
 
-        pred_boxes3d_selected = pred_boxes3d[inds]
-        raw_scores_selected = raw_scores[inds]
-        pred_classes_selected = pred_classes[inds]
-
-        # NMS thresh
-        boxes_bev_selected = kitti_utils.boxes3d_to_bev_torch(pred_boxes3d_selected)
-        keep_idx = iou3d_utils.nms_gpu(boxes_bev_selected, raw_scores_selected, cfg.RCNN.NMS_THRESH)
-        pred_boxes3d_selected = pred_boxes3d_selected[keep_idx]
-
-        scores_selected = raw_scores_selected[keep_idx]
-        pred_classes_selected = pred_classes_selected[keep_idx]
         pred_boxes3d_selected, scores_selected = pred_boxes3d_selected.cpu().numpy(), scores_selected.cpu().numpy()
         det_class_names = _class_names_from_ids(pred_classes_selected.cpu().numpy(), dataset.classes)
 
@@ -705,6 +761,8 @@ def eval_one_epoch_rcnn(model, dataloader, epoch_id, result_dir, logger):
 def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
     np.random.seed(666)
     mode = 'TEST' if args.test else 'EVAL'
+    score_thresh = _get_eval_score_thresh()
+    nms_thresh = _get_eval_nms_thresh()
 
     final_output_dir = os.path.join(result_dir, 'final_result', 'data')
     os.makedirs(final_output_dir, exist_ok=True)
@@ -719,6 +777,7 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
 
     logger.info('---- EPOCH %s JOINT EVALUATION ----' % epoch_id)
     logger.info('==> Output file: %s' % result_dir)
+    logger.info('RCNN post-processing thresholds: score=%.3f, nms=%.3f' % (score_thresh, nms_thresh))
     model.eval()
 
     thresh_list = [0.1, 0.3, 0.5, 0.7, 0.9]
@@ -754,7 +813,7 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
         rcnn_cls = ret_dict['rcnn_cls'].view(batch_size, -1, ret_dict['rcnn_cls'].shape[1])
         rcnn_reg = ret_dict['rcnn_reg'].view(batch_size, -1, ret_dict['rcnn_reg'].shape[1])  # (B, M, C)
 
-        pred_classes, raw_scores, norm_scores = _select_rcnn_scores_batch(rcnn_cls)
+        pred_classes, raw_scores, norm_scores = _select_rcnn_scores_batch(rcnn_cls, score_thresh)
         if cfg.RCNN.SIZE_RES_ON_ROI:
             pred_boxes3d = decode_bbox_target(
                 roi_boxes3d.view(-1, 7),
@@ -867,11 +926,11 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
             pred_boxes3d_np = pred_boxes3d.cpu().numpy()
             roi_scores_raw_np = roi_scores_raw.cpu().numpy()
             raw_scores_np = raw_scores.cpu().numpy()
+            rpn_scores_raw, _, _, _, _ = model.rpn.proposal_layer.get_point_cls_info(ret_dict['rpn_cls'])
 
-            rpn_cls_np = ret_dict['rpn_cls'].cpu().numpy()
             rpn_xyz_np = ret_dict['backbone_xyz'].cpu().numpy()
             seg_result_np = seg_result.cpu().numpy()
-            output_data = np.concatenate((rpn_xyz_np, rpn_cls_np.reshape(batch_size, -1, 1),
+            output_data = np.concatenate((rpn_xyz_np, rpn_scores_raw.cpu().numpy().reshape(batch_size, -1, 1),
                                           seg_result_np.reshape(batch_size, -1, 1)), axis=2)
 
             for k in range(batch_size):
@@ -888,27 +947,20 @@ def eval_one_epoch_joint(model, dataloader, epoch_id, result_dir, logger):
                                   default_class_name=class_names[0] if class_names else 'Car')
 
                 output_file = os.path.join(rpn_output_dir, '%06d.npy' % cur_sample_id)
-                np.save(output_file, output_data.astype(np.float32))
-
-        # scores thresh
-        inds = norm_scores > cfg.RCNN.SCORE_THRESH
+                np.save(output_file, output_data[k].astype(np.float32))
 
         for k in range(batch_size):
-            cur_inds = inds[k].view(-1)
-            if cur_inds.sum() == 0:
+            pred_boxes3d_selected, scores_selected, pred_classes_selected = _postprocess_rcnn_detections(
+                pred_boxes3d[k],
+                pred_classes[k],
+                raw_scores[k],
+                norm_scores[k],
+                score_thresh,
+                nms_thresh,
+            )
+            if pred_boxes3d_selected.shape[0] == 0:
                 continue
 
-            pred_boxes3d_selected = pred_boxes3d[k, cur_inds]
-            raw_scores_selected = raw_scores[k, cur_inds]
-            pred_classes_selected = pred_classes[k, cur_inds]
-
-            # NMS thresh
-            # rotated nms
-            boxes_bev_selected = kitti_utils.boxes3d_to_bev_torch(pred_boxes3d_selected)
-            keep_idx = iou3d_utils.nms_gpu(boxes_bev_selected, raw_scores_selected, cfg.RCNN.NMS_THRESH).view(-1)
-            pred_boxes3d_selected = pred_boxes3d_selected[keep_idx]
-            scores_selected = raw_scores_selected[keep_idx]
-            pred_classes_selected = pred_classes_selected[keep_idx]
             pred_boxes3d_selected, scores_selected = pred_boxes3d_selected.cpu().numpy(), scores_selected.cpu().numpy()
             det_class_names = _class_names_from_ids(pred_classes_selected.cpu().numpy(), dataset.classes)
 

@@ -191,7 +191,6 @@ The original PointRCNN README notes that the offline augmentation strategy usual
 #### Step 1: Generate augmented scenes
 
 From `tools`:
-m,
 ```bash
 cd tools
 python generate_aug_scene.py \
@@ -292,10 +291,68 @@ python tools/compute_cls_mean_size.py
 python tools/verify_bin_conversion.py
 ```
 
-### To run inference for final rcnn model with a specific pointcloud frame
+### To run PointRCNN inference in Open3D for one frame
+Run from the repository root. The script accepts a single `.bin` file and prints a one-frame FPS estimate before opening the viewer.
+If a matching GT label file exists next to the frame or in a sibling `label_2/` or `labels/` folder, it is drawn automatically as red bounding boxes.
+
 ```bash
-python infer_frame_open3d.py  \
-  --bin_file path_to_bin_file
+python infer_frame_open3d.py \
+  --cfg_file cfgs/default.yaml \
+  --ckpt ../output/rcnn/default/ckpt/checkpoint_epoch_40.pth \
+  --bin_file ../data/dataset/KITTI/aug_scene/training/rectified_data/010210.bin
+```
+
+### To run PointRCNN inference on a folder of consecutive frames and measure FPS
+Use `--bin_dir` for a folder of frames or `--bin_glob` if you want finer file matching. The script streams the detections in Open3D and prints these metrics at the end:
+
+- `Inference FPS`: model forward pass plus decode and NMS
+- `Processing FPS`: file load, preprocessing, inference, and Open3D update
+- `Display FPS`: processing FPS plus any playback cap from `--playback_fps`
+
+For KITTI-style camera-frame bins:
+
+```bash
+python tools/infer_frame_open3d.py \
+  --cfg_file cfgs/default.yaml \
+  --ckpt output/rcnn/default/ckpt/checkpoint_epoch_40.pth \
+  --bin_dir data/dataset/KITTI/object/training/velodyne \
+  --input_frame camera \
+  --score_thresh 0.2 \
+  --playback_fps 10 \
+  --save_json output/rcnn/default/sequence_fps.json
+```
+
+For raw Scala2-format bins described in [DATASET_FORMAT.md](DATASET_FORMAT.md), use `--input_frame lidar`. The script converts each frame to the camera frame internally before inference:
+
+```bash
+python infer_frame_open3d.py \
+  --cfg_file cfgs/default.yaml \
+  --ckpt ../output/rcnn/default/ckpt/checkpoint_epoch_40.pth \
+  --bin_dir ../data/scala2_data2 \
+  --input_frame lidar \
+  --score_thresh 0.6 \
+  --playback_fps 10 \
+  --save_json output/rcnn/default/raw_sequence_fps.json
+```
+
+Useful options:
+
+- `--max_frames 200`: stop after a fixed number of frames
+- `--stride 2`: use every second frame
+- `--loop`: replay the sequence until the Open3D window is closed
+- `--bin_pattern "*.bin"`: change the filename filter used with `--bin_dir`
+- `--no_cuda`: force CPU inference
+
+
+### To run evaluation on RCNN model
+
+```bash
+python eval_rcnn.py \
+  --cfg_file cfgs/default.yaml \
+  --eval_mode rcnn \
+  --ckpt ../output/rcnn/default/ckpt/checkpoint_epoch_40.pth \
+  --save_result \
+  --set TEST.SPLIT val
 ```
 
 ### To enable Open3D GUI in WSL:

@@ -189,6 +189,11 @@ class ProposalLayer(nn.Module):
 
         dist = proposals_ordered[:, 2]
         first_mask = (dist > nms_range_list[0]) & (dist <= nms_range_list[1])
+        second_mask = (dist > nms_range_list[1]) & (dist <= nms_range_list[2])
+
+        if first_mask.sum() == 0 or second_mask.sum() == 0:
+            return self.score_based_proposal(scores, proposals, order, class_ids)
+
         for i in range(1, len(nms_range_list)):
             # get proposal distance mask
             dist_mask = ((dist > nms_range_list[i - 1]) & (dist <= nms_range_list[i]))
@@ -206,17 +211,20 @@ class ProposalLayer(nn.Module):
                 if cur_class_ids is not None:
                     cur_class_ids = cur_class_ids[:pre_top_n_list[i]]
             else:
-                assert i == 2, '%d' % i
                 # this area doesn't have any points, so use rois of first area
                 cur_scores = scores_ordered[first_mask]
                 cur_proposals = proposals_ordered[first_mask]
                 cur_class_ids = class_ids_ordered[first_mask] if class_ids_ordered is not None else None
 
                 # fetch top K of first area
-                cur_scores = cur_scores[pre_top_n_list[i - 1]:][:pre_top_n_list[i]]
-                cur_proposals = cur_proposals[pre_top_n_list[i - 1]:][:pre_top_n_list[i]]
+                start_idx = min(pre_top_n_list[i - 1], cur_scores.shape[0])
+                cur_scores = cur_scores[start_idx:][:pre_top_n_list[i]]
+                cur_proposals = cur_proposals[start_idx:][:pre_top_n_list[i]]
                 if cur_class_ids is not None:
-                    cur_class_ids = cur_class_ids[pre_top_n_list[i - 1]:][:pre_top_n_list[i]]
+                    cur_class_ids = cur_class_ids[start_idx:][:pre_top_n_list[i]]
+
+            if cur_proposals.shape[0] == 0:
+                continue
 
             # oriented nms
             boxes_bev = kitti_utils.boxes3d_to_bev_torch(cur_proposals)
@@ -234,6 +242,12 @@ class ProposalLayer(nn.Module):
             proposals_single_list.append(cur_proposals[keep_idx])
             if class_ids_single_list is not None:
                 class_ids_single_list.append(cur_class_ids[keep_idx])
+
+        if len(scores_single_list) == 0:
+            empty_scores = scores.new_zeros((0,))
+            empty_proposals = proposals.new_zeros((0, proposals.shape[1]))
+            empty_class_ids = class_ids.new_zeros((0,), dtype=torch.long) if class_ids is not None else None
+            return empty_scores, empty_proposals, empty_class_ids
 
         scores_single = torch.cat(scores_single_list, dim=0)
         proposals_single = torch.cat(proposals_single_list, dim=0)
@@ -256,6 +270,10 @@ class ProposalLayer(nn.Module):
         cur_scores = scores_ordered[:cfg[self.mode].RPN_PRE_NMS_TOP_N]
         cur_proposals = proposals_ordered[:cfg[self.mode].RPN_PRE_NMS_TOP_N]
         cur_class_ids = class_ids_ordered[:cfg[self.mode].RPN_PRE_NMS_TOP_N] if class_ids_ordered is not None else None
+
+        if cur_proposals.shape[0] == 0:
+            empty_class_ids = class_ids.new_zeros((0,), dtype=torch.long) if class_ids is not None else None
+            return cur_scores, cur_proposals, empty_class_ids
 
         boxes_bev = kitti_utils.boxes3d_to_bev_torch(cur_proposals)
         if cfg.RPN.NMS_TYPE == 'rotate':

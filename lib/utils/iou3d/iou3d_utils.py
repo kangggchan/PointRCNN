@@ -66,6 +66,9 @@ def nms_gpu(boxes, scores, thresh):
     :param thresh:
     :return:
     """
+    if boxes.shape[0] == 0:
+        return scores.new_zeros((0,), dtype=torch.long)
+
     # areas = (x2 - x1) * (y2 - y1)
     order = scores.sort(0, descending=True)[1]
 
@@ -83,6 +86,9 @@ def nms_normal_gpu(boxes, scores, thresh):
     :param thresh:
     :return:
     """
+    if boxes.shape[0] == 0:
+        return scores.new_zeros((0,), dtype=torch.long)
+
     # areas = (x2 - x1) * (y2 - y1)
     order = scores.sort(0, descending=True)[1]
 
