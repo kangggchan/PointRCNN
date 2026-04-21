@@ -55,9 +55,10 @@ RPN:
     CLS_FC: [128]
     REG_FC: [128]
     DP_RATIO: 0.5
+    MULTI_CLASS_CLS: True
 
     # config of training
-    LOSS_CLS: SigmoidFocalLoss
+    LOSS_CLS: CrossEntropy
     FG_WEIGHT: 15
     FOCAL_ALPHA: [0.25, 0.75]
     FOCAL_GAMMA: 2.0

@@ -62,14 +62,25 @@ def model_joint_fn_decorator():
             rpn_cls_loss_func = model.rpn.rpn_cls_loss_func
 
         rpn_cls_label_flat = rpn_cls_label.view(-1)
-        rpn_cls_flat = rpn_cls.view(-1)
         fg_mask = (rpn_cls_label_flat > 0)
 
         # RPN classification loss
-        if cfg.RPN.LOSS_CLS == 'DiceLoss':
+        if rpn_cls.dim() > 2 and rpn_cls.shape[-1] > 1:
+            rpn_cls_reshape = rpn_cls.view(-1, rpn_cls.shape[-1])
+            cls_valid_mask = (rpn_cls_label_flat >= 0).float()
+            batch_loss_cls = rpn_cls_loss_func(rpn_cls_reshape, rpn_cls_label_flat.long())
+            rpn_loss_cls = (batch_loss_cls * cls_valid_mask).sum() / torch.clamp(cls_valid_mask.sum(), min=1.0)
+
+            pred_classes = torch.argmax(rpn_cls_reshape, dim=1)
+            fg_normalizer = torch.clamp(fg_mask.float().sum(), min=1.0)
+            tb_dict['rpn_cls_fg_acc'] = ((pred_classes[fg_mask] == rpn_cls_label_flat[fg_mask]).float().sum() /
+                                         fg_normalizer).item()
+
+        elif cfg.RPN.LOSS_CLS == 'DiceLoss':
             rpn_loss_cls = rpn_cls_loss_func(rpn_cls, rpn_cls_label_flat)
 
         elif cfg.RPN.LOSS_CLS == 'SigmoidFocalLoss':
+            rpn_cls_flat = rpn_cls.view(-1)
             rpn_cls_target = (rpn_cls_label_flat > 0).float()
             pos = (rpn_cls_label_flat > 0).float()
             neg = (rpn_cls_label_flat == 0).float()
@@ -84,6 +95,7 @@ def model_joint_fn_decorator():
             tb_dict['rpn_loss_cls_neg'] = rpn_loss_cls_neg.item()
 
         elif cfg.RPN.LOSS_CLS == 'BinaryCrossEntropy':
+            rpn_cls_flat = rpn_cls.view(-1)
             weight = rpn_cls_flat.new(rpn_cls_flat.shape[0]).fill_(1.0)
             weight[fg_mask] = cfg.RPN.FG_WEIGHT
             rpn_cls_label_target = (rpn_cls_label_flat > 0).float()
@@ -98,10 +110,13 @@ def model_joint_fn_decorator():
         point_num = rpn_reg.size(0) * rpn_reg.size(1)
         fg_sum = fg_mask.long().sum().item()
         if fg_sum != 0:
-            size_template_ids = kitti_utils.get_size_template_ids_torch(
-                rpn_reg_label.view(point_num, 7)[fg_mask][:, 3:6],
-                device=rpn_reg.device,
-            )
+            if cfg.RPN.MULTI_CLASS_CLS:
+                size_template_ids = (rpn_cls_label_flat[fg_mask] - 1).long()
+            else:
+                size_template_ids = kitti_utils.get_size_template_ids_torch(
+                    rpn_reg_label.view(point_num, 7)[fg_mask][:, 3:6],
+                    device=rpn_reg.device,
+                )
             anchor_size = kitti_utils.get_anchor_sizes_by_template_ids_torch(size_template_ids,
                                                                              device=rpn_reg.device)
             loss_loc, loss_angle, loss_size, reg_loss_dict = \

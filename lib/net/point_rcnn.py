@@ -39,13 +39,15 @@ class PointRCNN(nn.Module):
                     rpn_cls, rpn_reg = rpn_output['rpn_cls'], rpn_output['rpn_reg']
                     backbone_xyz, backbone_features = rpn_output['backbone_xyz'], rpn_output['backbone_features']
 
-                    rpn_scores_raw = rpn_cls[:, :, 0]
-                    rpn_scores_norm = torch.sigmoid(rpn_scores_raw)
-                    seg_mask = (rpn_scores_norm > cfg.RPN.SCORE_THRESH).float()
+                    _, rpn_scores_norm, _, pred_classes, _ = self.rpn.proposal_layer.get_point_cls_info(rpn_cls)
+                    if pred_classes is None:
+                        seg_mask = (rpn_scores_norm > cfg.RPN.SCORE_THRESH).float()
+                    else:
+                        seg_mask = ((pred_classes > 0) & (rpn_scores_norm > cfg.RPN.SCORE_THRESH)).float()
                     pts_depth = torch.norm(backbone_xyz, p=2, dim=2)
 
                     # proposal layer
-                    rois, roi_scores_raw = self.rpn.proposal_layer(rpn_scores_raw, rpn_reg, backbone_xyz)  # (B, M, 7)
+                    rois, roi_scores_raw = self.rpn.proposal_layer(rpn_cls, rpn_reg, backbone_xyz)  # (B, M, 7)
 
                     output['rois'] = rois
                     output['roi_scores_raw'] = roi_scores_raw
