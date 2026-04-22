@@ -164,13 +164,7 @@ python train_rcnn.py \
   --gt_database ../gt_database/train_gt_database_3level_multi.pkl
 ```
 
-## 7) Train RCNN stage
-
-There are two RCNN training strategies.
-
-### A) Online RCNN training
-
-This is the simpler workflow and uses the fixed RPN checkpoint directly.
+## 7) Train RCNN stage with online proposals
 
 ```bash
 cd tools
@@ -182,69 +176,6 @@ python train_rcnn.py \
   --rpn_ckpt ../output/rpn/default/ckpt/checkpoint_epoch_200.pth \
   --data_root ../data/dataset \
   --gt_database ../gt_database/train_gt_database_3level_multi.pkl
-```
-
-### B) Offline RCNN training (recommended)
-
-The original PointRCNN README notes that the offline augmentation strategy usually gives better results than the online one. For your custom dataset, the equivalent workflow is:
-
-#### Step 1: Generate augmented scenes
-
-From `tools`:
-```bash
-cd tools
-python generate_aug_scene.py \
-  --root_dir ../data/dataset \
-  --split train \
-  --class_name Car,Human,ForkLift,CargoBike,ELFplusplus,FTS \
-  --gt_database_dir gt_database/train_gt_database_3level_multi.pkl \
-  --aug_times 3
-```
-
-#### Step 2: Save RPN features and proposals for `train_aug`
-
-From `tools`:
-
-```bash
-cd tools
-python eval_rcnn.py \
-  --cfg_file cfgs/default.yaml \
-  --batch_size 8 \
-  --eval_mode rpn \
-  --ckpt ../output/rpn/default/ckpt/checkpoint_epoch_200.pth \
-  --data_root ../data/dataset \
-  --save_rpn_feature \
-  --set TEST.SPLIT train_aug TEST.RPN_POST_NMS_TOP_N 300 TEST.RPN_NMS_THRESH 0.85
-```
-
-If you also want offline evaluation features for validation, run:
-
-```bash
-python eval_rcnn.py \
-  --cfg_file cfgs/default.yaml \
-  --batch_size 4 \
-  --eval_mode rpn \
-  --ckpt ../output/rpn/default/ckpt/checkpoint_epoch_200.pth \
-  --data_root ../data/dataset \
-  --save_rpn_feature
-```
-
-#### Step 3: Train RCNN with offline proposals
-
-Before running this, set `TRAIN.SPLIT: train_aug` in `tools/cfgs/default.yaml`.
-
-```bash
-cd tools
-python train_rcnn.py \
-  --cfg_file cfgs/default.yaml \
-  --batch_size 4 \
-  --train_mode rcnn_offline \
-  --epochs 30 \
-  --ckpt_save_interval 1 \
-  --data_root ../data/dataset \
-  --gt_database ../gt_database/train_gt_database_3level_multi.pkl \
-  --rcnn_training_roi_dir ../output/rpn/default/eval/epoch_200/train_aug/detections/data \
-  --rcnn_training_feature_dir ../output/rpn/default/eval/epoch_200/train_aug/features
 ```
 
 #### Optional: CPU proposal sampling
@@ -328,10 +259,10 @@ For raw Scala2-format bins described in [DATASET_FORMAT.md](DATASET_FORMAT.md), 
 python infer_frame_open3d.py \
   --cfg_file cfgs/default.yaml \
   --ckpt ../output/rcnn/default/ckpt/checkpoint_epoch_40.pth \
-  --bin_dir ../data/scala2_data2 \
+  --bin_dir ../data/scala2/bin \
   --input_frame lidar \
   --score_thresh 0.6 \
-  --playback_fps 10 \
+  --playback_fps 20 \
   --save_json output/rcnn/default/raw_sequence_fps.json
 ```
 
@@ -344,15 +275,60 @@ Useful options:
 - `--no_cuda`: force CPU inference
 
 
-### To run evaluation on RCNN model
+### To evaluate an RPN checkpoint or export offline proposals
+
+Run from `tools` when you want proposal recall, saved detections, or offline RCNN features.
 
 ```bash
-python eval_rcnn.py \
+cd tools
+python eval_rpn.py \
   --cfg_file cfgs/default.yaml \
-  --eval_mode rcnn \
-  --ckpt ../output/rcnn/default/ckpt/checkpoint_epoch_40.pth \
-  --save_result \
-  --set TEST.SPLIT val
+  --ckpt ../output/rpn/default/ckpt/checkpoint_epoch_200.pth \
+  --data_root ../data/dataset \
+  --save_result
+```
+
+Add `--save_rpn_feature` when preparing the offline RCNN training workflow in section 7B.
+
+### To evaluate an RCNN checkpoint on `bin/` + `labels/`
+
+Run from the repository root. The script scans paired files under `data_root/bin` and `data_root/labels`, then writes a summary CSV under `output/rcnn_eval/` by default.
+
+```bash
+python tools/eval_rcnn.py \
+  --ckpt output/rcnn/default/ckpt/checkpoint_epoch_40.pth \
+  --data_root data/dataset \
+  --iou_thresh 0.5
+```
+
+### To benchmark Jetson or edge-device inference
+
+Use this to measure preprocessing, model, decode/NMS, and total latency on a representative frame set.
+
+```bash
+python tools/benchmark_jetson.py \
+  --cfg_file tools/cfgs/orin_realtime.yaml \
+  --ckpt output/rcnn/default/ckpt/checkpoint_epoch_40.pth \
+  --bin_glob "data/dataset/KITTI/object/training/velodyne/*.bin" \
+  --max_frames 16 \
+  --warmup 20 \
+  --repeats 20 \
+  --save_json output/benchmark_jetson.json
+```
+
+### To auto-label a Scala2 frame range
+
+Run from the repository root. The script reads raw Scala2 `bin/` frames, replaces existing labels that start with `--label_name`, and keeps other label lines untouched.
+
+```bash
+python label_scala2_range.py \
+  --data_root data/scala2 \
+  --start_idx 0 \
+  --end_idx 211 \
+  --ckpt output/rcnn/default/ckpt/checkpoint_epoch_40.pth \
+  --cfg_file tools/cfgs/default.yaml \
+  --score_thresh 0.5 \
+  --label_name Car
 ```
 
 ### To enable Open3D GUI in WSL:
